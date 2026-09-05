@@ -54,11 +54,7 @@ def checkpoint_controller(mode="ordered"):
     async def private(_player, message):
         messages.append(message)
 
-    async def activity(_player):
-        return None
-
     controller.private = private
-    controller._record_player_activity = activity
     return controller, player, messages
 
 

@@ -656,12 +656,13 @@ index c8a4959f..95e5e8a2 100644
  gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
          :gCycleMovement(grid, pos,d,p,false),
          engine(NULL),
-@@ -2752,6 +3207,7 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
+@@ -2752,7 +3207,8 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
          startBraked_(false),
          startBrakeReleaseTime_(-1),
          startBrakeReleaseSpeed_(0),
 +        raceStartTime_(se_GameTime()),
          replayToken_(++sg_cycleReplayToken),
+         lastPlayerTurnTime_(-1),
          lastMovementStartPosition_(pos),
          lastMovementStartTime_(0),
 @@ -2815,6 +3271,7 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
@@ -698,27 +699,29 @@ index c8a4959f..95e5e8a2 100644
      // keep this cycle alive
      tJUST_CONTROLLED_PTR< gCycle > keep( this->GetRefcount()>0 ? this : 0 );
  
-@@ -6127,6 +6589,7 @@ gCycle::gCycle(nMessage &m)
+@@ -6127,7 +6589,8 @@ gCycle::gCycle(nMessage &m)
          startBraked_(false),
          startBrakeReleaseTime_(-1),
          startBrakeReleaseSpeed_(0),
 +        raceStartTime_(0),
          replayToken_(0),
+         lastPlayerTurnTime_(-1),
          lastMovementStartPosition_(0, 0),
          lastMovementStartTime_(0),
 diff --git a/src/tron/gCycle.h b/src/tron/gCycle.h
 index db313743..852697f4 100644
 --- a/src/tron/gCycle.h
 +++ b/src/tron/gCycle.h
-@@ -183,6 +183,7 @@ class gCycle: public gCycleMovement
+@@ -183,7 +183,8 @@ class gCycle: public gCycleMovement
      bool startBraked_; //!< whether this cycle is staged under its ordinary synchronized brake
      REAL startBrakeReleaseTime_; //!< automatic brake-off time, or negative for player release
      REAL startBrakeReleaseSpeed_; //!< native spawn/checkpoint speed restored at brake release
 +    REAL raceStartTime_; //!< exact start used to align a private replay ghost
      unsigned long long replayToken_; //!< process-local identifier for compact replay events
+     REAL lastPlayerTurnTime_; //!< game time of the last turn actually made by this player
      void ApplyStartHoldDirection(int winding, unsigned short turnCount); //!< rotate in place without creating movement or walls
      void TurnDuringStartHold(int direction); //!< apply one grid-relative turn while waiting for brake
-@@ -402,6 +403,17 @@ public:
+@@ -402,7 +403,18 @@ public:
      bool IsStartHeld(REAL gameTime) const { return IsFrozen(gameTime) || startBraked_; }
      REAL ExactZoneEntryTime(const eCoord &center, REAL radius, REAL fallback) const;
      REAL SpawnTime() const { return spawnTime_; }
@@ -730,6 +733,7 @@ index db313743..852697f4 100644
 +        return freezeUntil_ >= 0 ? freezeUntil_ : raceStartTime_;
 +    }
 +    virtual bool IsServerGhost() const { return false; }
+     REAL LastPlayerTurnTime() const { return lastPlayerTurnTime_; }
      unsigned long long ReplayToken() const { return replayToken_; }
 +    void RestoreReplayEventState(const eCoord &position,
 +                                 const eCoord &direction, REAL speed,

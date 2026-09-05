@@ -71,16 +71,12 @@ class HelpSearchTests(unittest.IsolatedAsyncioTestCase):
         racer = Player("racer", "Racer")
         calls = []
 
-        async def record_activity(player):
-            return None
-
         async def rate_allowed(player):
             return True
 
         async def help_command(player, access_level, search_term):
             calls.append((player, access_level, search_term))
 
-        controller._record_player_activity = record_activity
         controller._command_rate_allowed = rate_allowed
         controller._command_help = help_command
 

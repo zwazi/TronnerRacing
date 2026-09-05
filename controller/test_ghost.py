@@ -15,6 +15,7 @@ from TronnerRacing import (
     StateStore,
     TronnerRacing as Controller,
     ghost_display_name,
+    normalize_ghost_preference,
     plain_console_text,
 )
 
@@ -89,6 +90,47 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
         run_id = store.add_replay(capture, 1012.5)
         return player, record, run_id
 
+    @staticmethod
+    def add_unfinished_attempt(
+        store: StateStore,
+        player: Player,
+        token: str,
+        closest_winzone_distance: float,
+        started_at: float,
+    ) -> int:
+        store.add_replay_settings(
+            "physics-1",
+            1,
+            [(b"CYCLE_START_SPEED", b"20")],
+        )
+        capture = ReplayCapture(
+            token=token,
+            player_log_name=player.log_name,
+            identity_key=player.identity_key,
+            username=player.record_name,
+            authenticated=True,
+            map_identifier="Tester/maps/Race-v1.aamap.xml",
+            revision_identifier="revision-1",
+            resource_key="resource-revision-1",
+            record_key="record-map",
+            started_at=started_at,
+            spawn_game_time=10.0,
+            x=1.25,
+            y=-2.5,
+            xdir=1.0,
+            ydir=0.0,
+            speed=20.0,
+            initial_turns=0,
+            size_factor=1.0,
+            start_mode="countdown",
+            checkpoint_spawn=False,
+            settings_identifier="physics-1",
+            release_offset_us=1_000_000,
+            events=[(1_100_000, 0), (3_000_000, 1)],
+            closest_winzone_distance=closest_winzone_distance,
+        )
+        return store.add_replay(capture, started_at + 10.0)
+
     def test_exact_record_replay_is_normalized_to_race_release(self):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
@@ -126,52 +168,39 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([replay.run_id for replay in replays], [run_id])
             store.close()
 
-    def test_legacy_ghost_name_is_ascii_and_0_2_8_safe(self):
-        self.assertEqual(
-            ghost_display_name(1, "RacerWithAVeryLongName"),
-            "#1 - Race Ghost",
-        )
-        self.assertEqual(ghost_display_name(23, "Jörg"), "#23 - J?r Ghost")
+    def test_legacy_ghost_name_is_plain_ascii_or_pb_and_0_2_8_safe(self):
+        self.assertEqual(ghost_display_name("RacerWithAVeryLongName"), "RacerWithAVeryL")
+        self.assertEqual(ghost_display_name("Jörg"), "J?rg")
+        self.assertEqual(ghost_display_name("Racer", personal_best=True), "PB")
         self.assertLessEqual(
-            len(ghost_display_name(123456789, "Racer").encode("ascii")),
+            len(ghost_display_name("RacerWithAVeryLongName").encode("ascii")),
             GHOST_LEGACY_NAME_BYTES,
         )
 
-    def test_saved_selection_waits_for_current_map_then_restores(self):
+    def test_pb_and_rank_preferences_are_canonical_and_durable(self):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             controller = object.__new__(Controller)
             controller.store = store
-            controller.current = None
-            controller.ghost_selections = {}
-            controller._saved_ghost_selections = {
-                "mapKey": "record-map",
-                "selections": {
-                    "auth:racer": {
-                        "selector": "pb",
-                        "runId": 7,
-                        "rank": 2,
-                        "recordIdentityKey": "auth:racer",
-                        "ghostName": "#2 - Race Ghost",
-                    }
-                },
+            controller.ghost_preferences = {
+                "auth:racer": "pb",
+                "auth:other": "rank 7",
             }
+            controller.ghost_selections = {}
+            controller._save_ghost_preferences()
+            controller._clear_ghost_selections()
 
-            controller._restore_ghost_selections()
-            self.assertTrue(controller._saved_ghost_selections)
-            self.assertFalse(controller.ghost_selections)
-
-            controller.current = SimpleNamespace(
-                key="resource-revision-1", records_key="record-map"
-            )
-            controller._restore_ghost_selections()
             self.assertEqual(
-                controller.ghost_selections["auth:racer"]["runId"], 7
+                store.get_json("ghost_preferences", {}),
+                {"auth:racer": "pb", "auth:other": "rank 7"},
             )
-            self.assertFalse(controller._saved_ghost_selections)
+            self.assertEqual(normalize_ghost_preference("personalbest"), "pb")
+            self.assertEqual(normalize_ghost_preference("7"), "rank 7")
+            self.assertEqual(normalize_ghost_preference("rank 7"), "rank 7")
+            self.assertIsNone(normalize_ghost_preference("wr"))
             store.close()
 
-    def test_ghost_settings_ignore_runtime_metadata_but_not_physics(self):
+    def test_ghost_settings_allow_tolerated_changes_but_not_other_physics(self):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             store.add_replay_settings(
@@ -179,6 +208,7 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
                 1,
                 [
                     (b"CYCLE_SPEED", b"20"),
+                    (b"CYCLE_RUBBER_MINDISTANCE_UNPREPARED", b"0.005"),
                     (b"PING_CHARITY_SERVER", b"151"),
                     (b"SERVER_OPTIONS", b"Current map: Epyon | Next Map: Retro"),
                 ],
@@ -188,6 +218,7 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
                 1,
                 [
                     (b"CYCLE_SPEED", b"20"),
+                    (b"CYCLE_RUBBER_MINDISTANCE_UNPREPARED", b"0"),
                     (b"PING_CHARITY_SERVER", b"181"),
                     (b"SERVER_OPTIONS", b"Current map: Epyon | Next Map: Triform"),
                 ],
@@ -197,6 +228,7 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
                 1,
                 [
                     (b"CYCLE_SPEED", b"21"),
+                    (b"CYCLE_RUBBER_MINDISTANCE_UNPREPARED", b"0"),
                     (b"PING_CHARITY_SERVER", b"181"),
                     (b"SERVER_OPTIONS", b"Current map: Epyon | Next Map: Triform"),
                 ],
@@ -442,7 +474,7 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
             lines = path.read_text(encoding="ascii").splitlines()
             self.assertEqual(lines[0], "TRONNER_GHOST 2")
             self.assertEqual(lines[1], f"RUN {run_id}")
-            self.assertEqual(lines[2], f"NAME {'#1 - Race Ghost'.encode().hex()}")
+            self.assertEqual(lines[2], f"NAME {'PB'.encode().hex()}")
             self.assertIn("DURATION_US 12500000", lines)
             self.assertIn("EVENT_COUNT 3", lines)
             self.assertIn("EVENT 0 2 0", lines)
@@ -656,6 +688,177 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("ranked time 11.000s", confirmation)
             self.assertEqual(record.best_seconds, 11.0)
             store.close()
+
+    async def test_unfinished_pb_uses_closest_progress_until_first_finish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = StateStore(root / "state.sqlite3")
+            player = Player("racer", "Racer", auth_name="Racer")
+            farther_run_id = self.add_unfinished_attempt(
+                store, player, "farther", 40.0, 1000.0
+            )
+
+            controller = object.__new__(Controller)
+            controller.sink = self.Sink()
+            controller.store = store
+            controller.repository = self.Repository()
+            controller.current = SimpleNamespace(
+                key="resource-revision-1",
+                records_key="record-map",
+                time_decimals=3,
+            )
+            controller.current_size_factor = 1.0
+            controller.active_replay_settings_identifier = "physics-1"
+            controller.round_active = True
+            controller.transitioning = False
+            controller.config = {"ghost_plan_dir": str(root / "ghosts")}
+            player.connected = True
+            controller.players = {player.log_name: player}
+
+            await controller._command_ghost(player, "pb")
+
+            self.assertEqual(
+                controller.ghost_selections[player.identity_key]["runId"],
+                farther_run_id,
+            )
+            self.assertEqual(
+                controller.ghost_selections[player.identity_key]["ghostName"],
+                "PB",
+            )
+            self.assertEqual(
+                store.get_json("ghost_preferences", {}).get(player.identity_key),
+                "pb",
+            )
+            confirmation = " ".join(
+                plain_console_text(command)
+                for command in controller.sink.commands
+                if command.startswith("PLAYER_MESSAGE ")
+            )
+            self.assertIn("closest unfinished attempt", confirmation)
+
+            closer_run_id = self.add_unfinished_attempt(
+                store, player, "closer", 12.0, 2000.0
+            )
+            candidates = store.ghost_replays_for_unfinished_pb(
+                "record-map", player.identity_key
+            )
+            self.assertEqual(
+                [replay.run_id for replay in candidates],
+                [closer_run_id, farther_run_id],
+            )
+            self.assertFalse(candidates[0].finished)
+            self.assertEqual(candidates[0].closest_winzone_distance, 12.0)
+            self.assertEqual(candidates[0].finish_seconds, 9.0)
+            controller.sink.commands.clear()
+            await controller._refresh_ghost_selections("record-map")
+            self.assertEqual(
+                controller.ghost_selections[player.identity_key]["runId"],
+                closer_run_id,
+            )
+            self.assertTrue(
+                any(
+                    "closest unfinished attempt" in plain_console_text(command)
+                    for command in controller.sink.commands
+                )
+            )
+
+            _finished_player, _record, finished_run_id = self.add_recorded_finish(store)
+            controller.sink.commands.clear()
+            await controller._command_ghost(player, "pb")
+
+            self.assertEqual(
+                controller.ghost_selections[player.identity_key]["runId"],
+                finished_run_id,
+            )
+            self.assertTrue(
+                store.ghost_replays_for_record(
+                    "record-map", store.records("record-map")[0]
+                )[0].finished
+            )
+            store.close()
+
+    async def test_rank_preference_restores_before_the_next_round_spawn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = StateStore(root / "state.sqlite3")
+            player, _record, run_id = self.add_recorded_finish(store)
+            player.connected = True
+            controller = object.__new__(Controller)
+            controller.sink = self.Sink()
+            controller.store = store
+            controller.repository = self.Repository()
+            controller.current = SimpleNamespace(
+                key="resource-revision-1",
+                records_key="record-map",
+                time_decimals=3,
+            )
+            controller.current_size_factor = 1.0
+            controller.active_replay_settings_identifier = "physics-1"
+            controller.round_active = True
+            controller.transitioning = False
+            controller.config = {"ghost_plan_dir": str(root / "ghosts")}
+            controller.players = {player.log_name: player}
+            controller.ghost_preferences = {}
+            controller.ghost_selections = {}
+
+            await controller._command_ghost(player, "1")
+            self.assertEqual(
+                store.get_json("ghost_preferences", {}).get(player.identity_key),
+                "rank 1",
+            )
+            controller.ghost_selections = {}
+            controller.sink.commands.clear()
+            await controller._restore_persistent_ghosts_for_round()
+
+            self.assertEqual(
+                controller.ghost_selections[player.identity_key]["runId"], run_id
+            )
+            self.assertEqual(
+                controller.ghost_selections[player.identity_key]["selector"],
+                "rank 1",
+            )
+            self.assertTrue(
+                any(
+                    command.startswith("GHOST_LOAD ")
+                    for command in controller.sink.commands
+                )
+            )
+            store.close()
+
+    def test_replay_progress_keeps_the_closest_route_field_distance(self):
+        capture = ReplayCapture(
+            token="progress",
+            player_log_name="racer",
+            identity_key="auth:racer",
+            username="Racer",
+            authenticated=True,
+            map_identifier="map",
+            revision_identifier="revision",
+            resource_key="resource-revision-1",
+            started_at=1000.0,
+            spawn_game_time=10.0,
+            x=0.0,
+            y=0.0,
+            xdir=1.0,
+            ydir=0.0,
+            speed=20.0,
+            initial_turns=0,
+            size_factor=1.0,
+            start_mode="countdown",
+            checkpoint_spawn=False,
+        )
+        controller = object.__new__(Controller)
+        controller.current = SimpleNamespace(key="resource-revision-1")
+        controller.final_countdown_route_map_key = "resource-revision-1"
+        controller.final_countdown_route_model = SimpleNamespace(
+            distance_at=lambda position: position[0]
+        )
+
+        controller._record_replay_route_progress(capture, (50.0, 0.0))
+        controller._record_replay_route_progress(capture, (12.0, 0.0))
+        controller._record_replay_route_progress(capture, (20.0, 0.0))
+
+        self.assertEqual(capture.closest_winzone_distance, 12.0)
 
     def test_rank_and_name_selectors_are_unambiguous(self):
         records = [
