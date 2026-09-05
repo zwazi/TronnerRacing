@@ -94,9 +94,9 @@
 -        // the stock brake-off destination on the ordinary movement path: all
 -        // 0.2.8+ clients already synchronize that state and its input time.
 -        return consumeBrakedStartDestination;
-+        // The server starts in brake state 1 while clients normally start in
-+        // state 0. Ignore that initial 0 (also sent by chat and focus loss),
-+        // and release only on an explicit brake-down packet or the timer.
++        // The client stays in its natural brake-off state during the hold.
++        // Turns, chat, and focus changes therefore keep reporting false;
++        // release only on an explicit brake-down packet or the timer.
 +        if (destination.braking && !freezeBrakeActionDown_)
 +        {
 +            freezeBrakeActionDown_ = true;
@@ -145,7 +145,7 @@
  {
      eCoord heldDirection = Grid()->GetDirection(winding);
      SetWindingNumberWrapped(winding);
-@@ -1751,7 +1741,7 @@
+@@ -1751,7 +1763,7 @@
      dir = heldDirection;
      lastDirDrive = heldDirection;
      lastTurnPos_ = freezePosition_;
@@ -154,7 +154,7 @@
      lastPlayerTurnTime_ = se_GameTime();
      pendingTurns.clear();
      refreshSpaceAhead_ = true;
-@@ -1765,8 +1755,7 @@
+@@ -1765,8 +1777,7 @@
  {
      int winding = windingNumberWrapped_;
      Grid()->Turn(winding, direction);
@@ -164,7 +164,7 @@
  }
  
  
-@@ -3299,6 +3288,8 @@
+@@ -3299,6 +3310,8 @@
          freezeStartHoldTurns_(false),
          freezeBrakeActionDown_(false),
          lastStartHoldMessageID_(0),
@@ -173,17 +173,50 @@
          startBraked_(false),
          startBrakeReleaseTime_(-1),
          startBrakeReleaseSpeed_(0),
-@@ -3316,6 +3307,9 @@
+@@ -3316,6 +3329,9 @@
          currentWall(NULL),
          lastWall(NULL)
  {
 +    if (sn_GetNetState() == nSERVER && p)
-+        sg_ResetPrivateZonesForUser(p->Owner());
++        sg_ResetPrivateZonesForUser(p->Owner(), true);
 +
      // A connection may control several local players. If one is already held
      // and a new, normally moving cycle appears on that connection, restore
      // normal client prediction immediately rather than affecting that racer.
-@@ -4879,6 +4873,28 @@
+@@ -3879,7 +3895,7 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
+     if (!std::isfinite(skewDot))
+         skewDot=0;
+ 
+-    // Countdown starts use the same stock brake state as manual brake starts.
++    // Timed countdown and manual brake starts share the same server-side hold.
+     // Split the frame at the exact release time so controller timing remains
+     // independent of the dedicated server's frame duration.
+     if (sn_GetNetState() == nSERVER && startBraked_ &&
+@@ -3887,9 +3903,9 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
+             currentTime >= startBrakeReleaseTime_)
+     {
+         REAL releaseTime = startBrakeReleaseTime_;
+-        if (releaseTime > lastTime &&
+-                gCycleMovement::TimestepCore(releaseTime, calculateAcceleration))
+-            return true;
++        lastTime = releaseTime;
++        lastTimeAnim = releaseTime;
++        lastTimestep_ = 0;
+         AccelerationDiscontinuity();
+         braking = 0;
+         OnBrakeStateChanged(releaseTime, braking);
+@@ -3901,7 +3917,9 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
+     // simulation time, not merely until the first server frame after it. This
+     // keeps the start independent of server frame duration and requires no
+     // client protocol extension.
+-    if ( sn_GetNetState() == nSERVER && freezeUntil_ >= 0 && currentTime <= freezeUntil_ )
++    if ( sn_GetNetState() == nSERVER &&
++            (startBraked_ ||
++             (freezeUntil_ >= 0 && currentTime <= freezeUntil_)) )
+     {
+         pos = freezePosition_;
+         dirDrive = freezeDirection_;
+@@ -4879,6 +4897,28 @@
              TurnDuringStartHold(1);
              return true;
          }
@@ -212,7 +245,7 @@
          if ( frozenStartHold && freezeUntilBrake_ && s_brake == *Act )
          {
              bool down = x > 0;
-@@ -4906,7 +4922,7 @@
+@@ -4906,7 +4946,7 @@
              }
              return true;
          }
@@ -221,7 +254,20 @@
              return true;
      }
  
-@@ -6683,6 +6699,8 @@
+@@ -4969,6 +5010,12 @@
+         startBrakeReleaseSpeed_ = 0;
+         freezeStartHoldTurns_ = false;
+         raceStartTime_ = time;
++        sg_ResetPrivateZonesForUser(Owner(), true);
++        if (freezeClientZeroAcceleration_)
++        {
++            sg_ReleaseClientZeroAcceleration(Owner());
++            freezeClientZeroAcceleration_ = false;
++        }
+         brakingReservoir = 1;
+         verletSpeed_ = releaseSpeed;
+         acceleration = 0;
+@@ -6683,6 +6729,8 @@
          freezeStartHoldTurns_(false),
          freezeBrakeActionDown_(false),
          lastStartHoldMessageID_(0),
@@ -230,7 +276,7 @@
          startBraked_(false),
          startBrakeReleaseTime_(-1),
          startBrakeReleaseSpeed_(0),
-@@ -8512,6 +8530,8 @@
+@@ -8512,43 +8560,45 @@
      freezeUntilBrake_ = true;
      freezeStartHoldTurns_ = true;
      freezeBrakeActionDown_ = braking != 0;
@@ -239,7 +285,37 @@
      braking = 0;
      verletSpeed_ = 0;
      acceleration = 0;
-@@ -8547,6 +8567,8 @@
+     lastTimestep_ = 0;
+     lastMovementStartPosition_ = pos;
+     lastMovementStartTime_ = lastTime;
+     lastMovementValid_ = false;
+     correctPosSmooth = eCoord(0, 0);
+     correctDistanceSmooth = 0;
+     lastGoodPosition_ = pos;
+     predictPosition_ = pos;
+     RequestSyncOwner();
+     RequestSyncAll();
+ }
+ 
+ void gCycle::StartBraked(REAL releaseAfterSeconds) {
+     if (!Alive())
+         return;
+     if (currentWall)
+         DropWall(false);
+ 
+-    if (freezeClientZeroAcceleration_)
+-    {
+-        sg_ReleaseClientZeroAcceleration(Owner());
+-        freezeClientZeroAcceleration_ = false;
+-    }
++    if (!freezeClientZeroAcceleration_)
++        freezeClientZeroAcceleration_ = sg_AcquireClientZeroAcceleration(Owner());
+ 
+     freezeUntil_ = -1;
+     freezeReleaseStart_ = -1;
+     freezeReleaseUntil_ = -1;
+     freezeUntilBrake_ = false;
+     freezePosition_ = pos;
      freezeDirection_ = dirDrive;
      freezeStartHoldTurns_ = true;
      freezeBrakeActionDown_ = false;
@@ -248,6 +324,29 @@
      startBraked_ = true;
      startBrakeReleaseTime_ = -1;
      startBrakeReleaseSpeed_ = verletSpeed_;
++    sg_ResetPrivateZonesForUser(Owner(), false);
+     if (std::isfinite(releaseAfterSeconds) && releaseAfterSeconds >= 0)
+         startBrakeReleaseTime_ = se_GameTime() + releaseAfterSeconds;
+@@ -8556,18 +8606,15 @@
+-    unsigned short oldBraking = braking;
+-    braking = 1;
++    braking = 0;
+     brakingReservoir = 1;
+     verletSpeed_ = 0;
+     acceleration = 0;
+     lastTimestep_ = 0;
+     lastMovementStartPosition_ = pos;
+     lastMovementStartTime_ = lastTime;
+     lastMovementValid_ = false;
+     correctPosSmooth = eCoord(0, 0);
+     correctDistanceSmooth = 0;
+     lastGoodPosition_ = pos;
+     predictPosition_ = pos;
+-    if (braking != oldBraking)
+-        OnBrakeStateChanged(se_GameTime(), braking);
+     sg_WriteCycleReplayState(this, "brake_hold", se_GameTime());
+     RequestSyncOwner();
+     RequestSyncAll();
 --- a/src/tron/gCycle.h
 +++ b/src/tron/gCycle.h
 @@ -180,13 +180,16 @@
@@ -323,22 +422,22 @@
      }
  }
  
-+void gZone::ResetPrivateLifetime()
++void gZone::ResetPrivateLifetime(bool startGrowth)
 +{
 +    if (!privateUser_)
 +        return;
 +
-+    // Keep the same network object alive and only rebase its radius function.
-+    // Recreating it causes stock clients to alternate between old and new zone
-+    // objects; a targeted sync gives the owner one continuous, smooth zone.
++    // Keep the same network object alive and rebase its radius function. A
++    // held respawn stays at the map-defined initial radius; its release resets
++    // the same object again and restores the map-defined growth rate.
 +    SetReferenceTime();
 +    SetRadius(privateInitialRadius_);
-+    SetExpansionSpeed(privateInitialExpansionSpeed_);
++    SetExpansionSpeed(startGrowth ? privateInitialExpansionSpeed_ : 0);
 +    resizeRequested_ = false;
 +    RequestSync(privateUser_, true);
 +}
 +
-+void sg_ResetPrivateZonesForUser(int user)
++void sg_ResetPrivateZonesForUser(int user, bool startGrowth)
 +{
 +    if (user <= 0 || user > MAXCLIENTS)
 +        return;
@@ -346,7 +445,7 @@
 +         zone != sg_Zones.end(); ++zone)
 +    {
 +        if (*zone && (*zone)->PrivateUser() == user)
-+            (*zone)->ResetPrivateLifetime();
++            (*zone)->ResetPrivateLifetime(startGrowth);
 +    }
 +}
 +
@@ -359,8 +458,8 @@
  
  class eTeam;
  
-+//! Restart map-defined private zones for one network user on respawn.
-+void sg_ResetPrivateZonesForUser(int user);
++//! Reset map-defined private zones for one user, optionally starting growth.
++void sg_ResetPrivateZonesForUser(int user, bool startGrowth);
 +
  //! mathematical function (to be moved into tools sometime, and currently limited to linear functions)
  class tFunction
@@ -369,7 +468,7 @@
      gZone &         SetOwner            (ePlayerNetID *pOwner); //!< Sets the current owner
      ePlayerNetID *  GetOwner            () {return pOwner_;}  //!< Gets the current owner
      void            SetPrivateUser      (int user); //!< Restricts visibility and cycle interaction to one network user
-+    void            ResetPrivateLifetime(); //!< Restarts this private zone's map-defined growth
++    void            ResetPrivateLifetime(bool startGrowth); //!< Resets this private zone and optionally starts growth
      int             PrivateUser         () const { return privateUser_; }
      virtual bool    ShouldTransmitTo    (int user) const;
      gZone &         SetSeekingCycle     (gCycle *pCycle) {if (pCycle) {seeking_ = true;} else {seeking_ = false;} pSeekingCycle_ = pCycle; return *this;}  //!< Sets the current seeking cycle
