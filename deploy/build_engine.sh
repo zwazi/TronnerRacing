@@ -9,6 +9,7 @@ upstream_commit=$(tr -d '[:space:]' < "$repository_dir/engine/UPSTREAM_COMMIT")
 patch_files=(
     "$repository_dir/engine/patches/tronner-racing.patch"
     "$repository_dir/engine/patches/ghost-replay.patch"
+    "$repository_dir/engine/patches/start-zone-lifecycle.patch"
 )
 temporary_workspace=
 
