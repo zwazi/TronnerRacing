@@ -146,7 +146,7 @@ class CheckpointRespawnTests(unittest.IsolatedAsyncioTestCase):
         )
         await cancel_tasks(countdown)
 
-    async def test_custom_countdown_applies_to_checkpoint_respawn(self):
+    async def test_custom_respawn_delay_does_not_change_countdown_length(self):
         controller, player = checkpoint_respawn_controller("countdown")
         controller.start_preferences[player.identity_key] = "countdown 9"
         player.checkpoint_respawn_requested = True
@@ -155,10 +155,10 @@ class CheckpointRespawnTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(
             "RESPAWN_PLAYER_CHECKPOINT_BRAKED "
-            "racer false 10 20 0 1 12.5 7 9",
+            "racer false 10 20 0 1 12.5 7 3",
             controller.sink.commands,
         )
-        self.assertEqual(player.start_countdown_seconds, 9)
+        self.assertEqual(player.start_respawn_delay_seconds, 9)
         await cancel_tasks(controller)
 
     async def test_cp_can_replace_an_ordinary_braked_spawn_before_takeoff(self):

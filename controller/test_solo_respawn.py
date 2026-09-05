@@ -40,23 +40,49 @@ def controller_with(*players):
 
 
 class SoloRespawnTests(unittest.IsolatedAsyncioTestCase):
-    async def test_last_alive_racer_uses_fast_empty_arena_respawn(self):
+    async def test_last_alive_racer_uses_saved_respawn_delay(self):
         player = Player("solo", "Solo", alive=True)
         controller, scheduled = controller_with(player)
 
         await controller._handle_cycle_destroyed("solo 1 2 1 0 Solo 10 DEATHZONE")
 
         self.assertFalse(player.alive)
-        self.assertEqual(scheduled, [(player, 0.1)])
+        self.assertEqual(scheduled, [(player, 0.0)])
 
-    async def test_normal_delay_is_retained_while_another_racer_is_alive(self):
-        player = Player("first", "First", alive=True)
+    async def test_same_saved_delay_is_used_while_another_racer_is_alive(self):
+        player = Player(
+            "first",
+            "First",
+            alive=True,
+            start_respawn_delay_seconds=1.5,
+        )
         other = Player("second", "Second", alive=True)
         controller, scheduled = controller_with(player, other)
+        controller.start_preferences = {player.identity_key: "immediate 1.5"}
 
         await controller._handle_cycle_destroyed("first 1 2 1 0 First 10 DEATHZONE")
 
-        self.assertEqual(scheduled, [(player, None)])
+        self.assertEqual(scheduled, [(player, 1.5)])
+
+    async def test_saved_delay_is_identical_solo_and_multiplayer(self):
+        solo = Player("solo", "Solo", alive=True)
+        solo_controller, solo_scheduled = controller_with(solo)
+        solo_controller.start_preferences = {solo.identity_key: "brake 2.25"}
+
+        multi = Player("multi", "Multi", alive=True)
+        other = Player("other", "Other", alive=True)
+        multi_controller, multi_scheduled = controller_with(multi, other)
+        multi_controller.start_preferences = {multi.identity_key: "brake 2.25"}
+
+        await solo_controller._handle_cycle_destroyed(
+            "solo 1 2 1 0 Solo 10 DEATHZONE"
+        )
+        await multi_controller._handle_cycle_destroyed(
+            "multi 1 2 1 0 Multi 10 DEATHZONE"
+        )
+
+        self.assertEqual(solo_scheduled, [(solo, 2.25)])
+        self.assertEqual(multi_scheduled, [(multi, 2.25)])
 
     async def test_destroyed_held_spawn_is_rescheduled(self):
         player = Player(
@@ -78,7 +104,7 @@ class SoloRespawnTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(player.respawn_created_game)
         self.assertEqual(player.generation, 3)
         self.assertTrue(freeze.cancelled())
-        self.assertEqual(scheduled, [(player, 0.1)])
+        self.assertEqual(scheduled, [(player, 0.0)])
 
 
 if __name__ == "__main__":

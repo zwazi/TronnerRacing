@@ -1,0 +1,384 @@
+--- a/src/tron/gCycle.cpp
++++ b/src/tron/gCycle.cpp
+@@ -1661,68 +1661,60 @@
+     }
+ }
+ 
+-static constexpr bool sg_ConsumeBrakedStartDestination(
+-    bool turnCountAdvanced, bool clientBrakeWasDown, bool clientBrakeDown)
+-{
+-    // A turn carrying the client's pre-sync brake-off state is only a turn.
+-    // Once brake-down has been reported, a combined turn/brake-off packet is
+-    // the real release and must retain its stock simulation timestamp.
+-    return turnCountAdvanced && !(clientBrakeWasDown && !clientBrakeDown);
+-}
+-
+-static_assert(sg_ConsumeBrakedStartDestination(true, false, false),
+-              "a pre-brake turn must stay held");
+-static_assert(sg_ConsumeBrakedStartDestination(true, false, true),
+-              "a turn that establishes brake-down must stay held");
+-static_assert(!sg_ConsumeBrakedStartDestination(true, true, false),
+-              "a combined turn and brake release must keep native timing");
+-static_assert(!sg_ConsumeBrakedStartDestination(false, false, false),
+-              "a brake-only release must keep native timing");
+-
++static constexpr int sg_PositiveModulo(int value, int modulus)
++{
++    return ((value % modulus) + modulus) % modulus;
++}
++
++static constexpr int sg_StartHoldTurnDistance(
++    int initialWinding, int currentWinding, int axes)
++{
++    return axes <= 0 ? 0 :
++        (sg_PositiveModulo(currentWinding - initialWinding, axes) <=
++         axes - sg_PositiveModulo(currentWinding - initialWinding, axes)
++         ? sg_PositiveModulo(currentWinding - initialWinding, axes)
++         : axes - sg_PositiveModulo(currentWinding - initialWinding, axes));
++}
++
++static_assert(sg_StartHoldTurnDistance(0, 7, 8) == 1,
++              "one left on eight axes counts as one turn");
++static_assert(sg_StartHoldTurnDistance(0, 3, 8) == 3,
++              "five left on eight axes counts as three turns");
++static_assert(sg_StartHoldTurnDistance(0, 0, 8) == 0,
++              "left then right counts as zero turns");
++static_assert(sg_StartHoldTurnDistance(0, 9, 16) == 7,
++              "the shortest-net rule scales with arena axes");
++
+ bool gCycle::HandleStartHoldDestination(const gDestination &destination)
+ {
+     if (sn_GetNetState() != nSERVER || !freezeStartHoldTurns_ ||
+             (!IsFrozen(se_GameTime()) && !startBraked_))
+         return false;
+ 
+-    // A client sends turns as destinations. Only an advancing turn counter is
+-    // proof of a turn: brake-only destinations can contain a slightly
+-    // different direction vector and must never rotate the held cycle.
+-    bool turnCountAdvanced = destination.turns != 0 &&
+-        static_cast<short>(destination.turns - turns) > 0;
+-    bool consumeBrakedStartDestination = false;
+-    if (startBraked_)
++    // The synchronized turn counter is deliberately rewritten to the shortest
++    // net rotation during a hold, so direction is the authoritative proof of
++    // another held turn. Nearest winding filters harmless vector jitter from
++    // brake-only packets.
++    int winding = Grid()->DirectionWinding(destination.direction);
++    if (winding != windingNumberWrapped_)
+     {
+-        bool clientBrakeWasDown = freezeBrakeActionDown_;
+-        freezeBrakeActionDown_ = destination.braking;
+-        consumeBrakedStartDestination = sg_ConsumeBrakedStartDestination(
+-            turnCountAdvanced, clientBrakeWasDown, destination.braking);
+-    }
+-    if (turnCountAdvanced)
+-    {
+-        int winding = Grid()->DirectionWinding(destination.direction);
+-        ApplyStartHoldDirection(winding, destination.turns);
+-
+-        // This turn is applied here rather than entering the normal movement
+-        // queue. Acknowledge the turn itself so the owner cannot replay it
+-        // after launch, but leave the brake packet to the original path.
+-        if ((!startBraked_ || consumeBrakedStartDestination) &&
+-                destination.messageID > 1 &&
+-                (lastStartHoldMessageID_ <= 1 ||
+-                 static_cast<short>(destination.messageID -
+-                                    lastStartHoldMessageID_) > 0))
+-            lastStartHoldMessageID_ = destination.messageID;
++        ApplyStartHoldDirection(winding);
+     }
+ 
+     if (startBraked_)
+     {
+-        // Turns are consumed above so they cannot replay after launch. Leave
+-        // the stock brake-off destination on the ordinary movement path: all
+-        // 0.2.8+ clients already synchronize that state and its input time.
+-        return consumeBrakedStartDestination;
++        // The server starts in brake state 1 while clients normally start in
++        // state 0. Ignore that initial 0 (also sent by chat and focus loss),
++        // and release only on an explicit brake-down packet or the timer.
++        if (destination.braking && !freezeBrakeActionDown_)
++        {
++            freezeBrakeActionDown_ = true;
++            AccelerationDiscontinuity();
++            braking = 0;
++            OnBrakeStateChanged(se_GameTime(), braking);
++        }
+     }
+-
+-    if (freezeUntilBrake_)
++    else if (freezeUntilBrake_)
+     {
+         bool down = destination.braking;
+         bool brakeChanged = down != freezeBrakeActionDown_;
+@@ -1737,12 +1729,32 @@
+         }
+     }
+ 
++    if (destination.messageID > 1 &&
++            (lastStartHoldMessageID_ <= 1 ||
++             static_cast<short>(destination.messageID -
++                                lastStartHoldMessageID_) > 0))
++        lastStartHoldMessageID_ = destination.messageID;
++
+     // Consume the destination here so its frozen turn or starting brake action
+     // is not replayed by the normal movement simulation after release.
+     return true;
+ }
+ 
+-void gCycle::ApplyStartHoldDirection(int winding, unsigned short turnCount)
++unsigned short gCycle::StartHoldTurnCount(int winding) const
++{
++    int axes = Grid()->WindingNumber();
++    if (axes <= 0)
++        return startHoldInitialTurns_;
++    int distance = sg_StartHoldTurnDistance(
++        startHoldInitialWinding_, winding, axes);
++    unsigned int count = static_cast<unsigned int>(startHoldInitialTurns_) +
++        static_cast<unsigned int>(distance);
++    return static_cast<unsigned short>(std::min(
++        count,
++        static_cast<unsigned int>(std::numeric_limits<unsigned short>::max())));
++}
++
++void gCycle::ApplyStartHoldDirection(int winding)
+ {
+     eCoord heldDirection = Grid()->GetDirection(winding);
+     SetWindingNumberWrapped(winding);
+@@ -1751,7 +1741,7 @@
+     dir = heldDirection;
+     lastDirDrive = heldDirection;
+     lastTurnPos_ = freezePosition_;
+-    turns = turnCount;
++    turns = StartHoldTurnCount(winding);
+     lastPlayerTurnTime_ = se_GameTime();
+     pendingTurns.clear();
+     refreshSpaceAhead_ = true;
+@@ -1765,8 +1755,7 @@
+ {
+     int winding = windingNumberWrapped_;
+     Grid()->Turn(winding, direction);
+-    ApplyStartHoldDirection(
+-        winding, static_cast<unsigned short>(turns + 1));
++    ApplyStartHoldDirection(winding);
+ }
+ 
+ 
+@@ -3299,6 +3288,8 @@
+         freezeStartHoldTurns_(false),
+         freezeBrakeActionDown_(false),
+         lastStartHoldMessageID_(0),
++        startHoldInitialWinding_(0),
++        startHoldInitialTurns_(0),
+         startBraked_(false),
+         startBrakeReleaseTime_(-1),
+         startBrakeReleaseSpeed_(0),
+@@ -3316,6 +3307,9 @@
+         currentWall(NULL),
+         lastWall(NULL)
+ {
++    if (sn_GetNetState() == nSERVER && p)
++        sg_ResetPrivateZonesForUser(p->Owner());
++
+     // A connection may control several local players. If one is already held
+     // and a new, normally moving cycle appears on that connection, restore
+     // normal client prediction immediately rather than affecting that racer.
+@@ -4879,6 +4873,28 @@
+             TurnDuringStartHold(1);
+             return true;
+         }
++        if ( startBraked_ && s_brake == *Act )
++        {
++            if (x > .5 && !freezeBrakeActionDown_)
++            {
++                freezeBrakeActionDown_ = true;
++                AccelerationDiscontinuity();
++                braking = 0;
++                OnBrakeStateChanged(se_GameTime(), braking);
++            }
++            return true;
++        }
++        if ( startBraked_ && s_brakeToggle == *Act )
++        {
++            if (x > 0 && !freezeBrakeActionDown_)
++            {
++                freezeBrakeActionDown_ = true;
++                AccelerationDiscontinuity();
++                braking = 0;
++                OnBrakeStateChanged(se_GameTime(), braking);
++            }
++            return true;
++        }
+         if ( frozenStartHold && freezeUntilBrake_ && s_brake == *Act )
+         {
+             bool down = x > 0;
+@@ -4906,7 +4922,7 @@
+             }
+             return true;
+         }
+-        if ( frozenStartHold )
++        if ( frozenStartHold || startBraked_ )
+             return true;
+     }
+ 
+@@ -6683,6 +6699,8 @@
+         freezeStartHoldTurns_(false),
+         freezeBrakeActionDown_(false),
+         lastStartHoldMessageID_(0),
++        startHoldInitialWinding_(0),
++        startHoldInitialTurns_(0),
+         startBraked_(false),
+         startBrakeReleaseTime_(-1),
+         startBrakeReleaseSpeed_(0),
+@@ -8512,6 +8530,8 @@
+     freezeUntilBrake_ = true;
+     freezeStartHoldTurns_ = true;
+     freezeBrakeActionDown_ = braking != 0;
++    startHoldInitialWinding_ = windingNumberWrapped_;
++    startHoldInitialTurns_ = turns;
+     braking = 0;
+     verletSpeed_ = 0;
+     acceleration = 0;
+@@ -8547,6 +8567,8 @@
+     freezeDirection_ = dirDrive;
+     freezeStartHoldTurns_ = true;
+     freezeBrakeActionDown_ = false;
++    startHoldInitialWinding_ = windingNumberWrapped_;
++    startHoldInitialTurns_ = turns;
+     startBraked_ = true;
+     startBrakeReleaseTime_ = -1;
+     startBrakeReleaseSpeed_ = verletSpeed_;
+--- a/src/tron/gCycle.h
++++ b/src/tron/gCycle.h
+@@ -180,13 +180,16 @@
+     bool freezeStartHoldTurns_; //!< whether held turn destinations rotate the cycle in place
+     bool freezeBrakeActionDown_; //!< last continuous-brake action state during the hold
+     unsigned short lastStartHoldMessageID_; //!< newest consumed held input acknowledged to the owner
++    int startHoldInitialWinding_; //!< direction at the beginning of a held start
++    unsigned short startHoldInitialTurns_; //!< turn count at the beginning of a held start
+     bool startBraked_; //!< whether this cycle is staged under its ordinary synchronized brake
+     REAL startBrakeReleaseTime_; //!< automatic brake-off time, or negative for player release
+     REAL startBrakeReleaseSpeed_; //!< native spawn/checkpoint speed restored at brake release
+     REAL raceStartTime_; //!< exact start used to align a private replay ghost
+     unsigned long long replayToken_; //!< process-local identifier for compact replay events
+     REAL lastPlayerTurnTime_; //!< game time of the last turn actually made by this player
+-    void ApplyStartHoldDirection(int winding, unsigned short turnCount); //!< rotate in place without creating movement or walls
++    unsigned short StartHoldTurnCount(int winding) const; //!< shortest net rotation from the held start direction
++    void ApplyStartHoldDirection(int winding); //!< rotate in place without creating movement or walls
+     void TurnDuringStartHold(int direction); //!< apply one grid-relative turn while waiting for brake
+     eCoord lastMovementStartPosition_; //!< start of the last authoritative movement segment
+     REAL lastMovementStartTime_; //!< game time at the start of that segment
+--- a/src/tron/gParser.cpp
++++ b/src/tron/gParser.cpp
+@@ -1080,14 +1080,16 @@
+         // leaving zone undeleted is no memory leak here, the gid takes control of it
+         if ( zone )
+         {
++            zone->SetRadius( radius*sizeMultiplier );
++            zone->SetExpansionSpeed( growth*sizeMultiplier );
++
+             if (sg_privateZoneTarget > 0)
+             {
++                // Capture the completed map definition as this recipient's
++                // per-life radius and growth baseline.
+                 zone->SetPrivateUser(sg_privateZoneTarget);
+             }
+ 
+-            zone->SetRadius( radius*sizeMultiplier );
+-            zone->SetExpansionSpeed( growth*sizeMultiplier );
+-
+             if (canRotate)
+             {
+                 //  check whether this is deathzone or not (since deathzone has it's own rotation)
+--- a/src/tron/gZone.cpp
++++ b/src/tron/gZone.cpp
+@@ -430,6 +430,8 @@
+     dynamicCreation_ = dynamicCreation;
+     delayCreation_ = delayCreation;
+     privateUser_ = 0;
++    privateInitialRadius_ = 0;
++    privateInitialExpansionSpeed_ = 0;
+     wallInteract_ = false;
+     wallBouncesLeft_ = 0;
+     wallPenetrate_ = false;
+@@ -510,6 +512,8 @@
+     dynamicCreation_ = false;
+     delayCreation_ = false;
+     privateUser_ = 0;
++    privateInitialRadius_ = 0;
++    privateInitialExpansionSpeed_ = 0;
+     wallInteract_ = false;
+     wallBouncesLeft_ = 0;
+     wallPenetrate_ = false;
+@@ -979,6 +983,8 @@
+     }
+ 
+     privateUser_ = user;
++    privateInitialRadius_ = GetRadius();
++    privateInitialExpansionSpeed_ = GetExpansionSpeed();
+ 
+     // Some legacy zone constructors request a broadcast sync before the map
+     // parser has finished configuring the zone. Consume those requests now so
+@@ -993,6 +999,33 @@
+     }
+ }
+ 
++void gZone::ResetPrivateLifetime()
++{
++    if (!privateUser_)
++        return;
++
++    // Keep the same network object alive and only rebase its radius function.
++    // Recreating it causes stock clients to alternate between old and new zone
++    // objects; a targeted sync gives the owner one continuous, smooth zone.
++    SetReferenceTime();
++    SetRadius(privateInitialRadius_);
++    SetExpansionSpeed(privateInitialExpansionSpeed_);
++    resizeRequested_ = false;
++    RequestSync(privateUser_, true);
++}
++
++void sg_ResetPrivateZonesForUser(int user)
++{
++    if (user <= 0 || user > MAXCLIENTS)
++        return;
++    for (std::deque<gZone *>::iterator zone = sg_Zones.begin();
++         zone != sg_Zones.end(); ++zone)
++    {
++        if (*zone && (*zone)->PrivateUser() == user)
++            (*zone)->ResetPrivateLifetime();
++    }
++}
++
+ bool gZone::ShouldTransmitTo(int user) const
+ {
+     return (!privateUser_ || privateUser_ == user) &&
+--- a/src/tron/gZone.h
++++ b/src/tron/gZone.h
+@@ -38,6 +38,9 @@
+ 
+ class eTeam;
+ 
++//! Restart map-defined private zones for one network user on respawn.
++void sg_ResetPrivateZonesForUser(int user);
++
+ //! mathematical function (to be moved into tools sometime, and currently limited to linear functions)
+ class tFunction
+ {
+@@ -126,6 +129,7 @@
+     gZone &         SetOwner            (ePlayerNetID *pOwner); //!< Sets the current owner
+     ePlayerNetID *  GetOwner            () {return pOwner_;}  //!< Gets the current owner
+     void            SetPrivateUser      (int user); //!< Restricts visibility and cycle interaction to one network user
++    void            ResetPrivateLifetime(); //!< Restarts this private zone's map-defined growth
+     int             PrivateUser         () const { return privateUser_; }
+     virtual bool    ShouldTransmitTo    (int user) const;
+     gZone &         SetSeekingCycle     (gCycle *pCycle) {if (pCycle) {seeking_ = true;} else {seeking_ = false;} pSeekingCycle_ = pCycle; return *this;}  //!< Sets the current seeking cycle
+@@ -215,6 +219,8 @@
+     bool dynamicCreation_;  //??? remove
+     bool delayCreation_;
+     int privateUser_;       //!< zero for global zones, otherwise the sole network recipient
++    REAL privateInitialRadius_; //!< map-defined radius restored for the private recipient
++    REAL privateInitialExpansionSpeed_; //!< map-defined growth restored for the private recipient
+     tJUST_CONTROLLED_PTR< ePlayerNetID > pOwner_;
+     tJUST_CONTROLLED_PTR< gCycle > pSeekingCycle_;       //!< cycle owner of this zone
+     bool seeking_;

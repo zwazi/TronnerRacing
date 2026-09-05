@@ -233,7 +233,7 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
             controller.sink.commands,
             [
                 "RESPAWN_PLAYER_CHECKPOINT_BRAKED "
-                "racer false 10 20 0 1 31.5 8 7",
+                "racer false 10 20 0 1 31.5 8 3",
             ],
         )
         await cancel_tasks(controller)
@@ -272,7 +272,7 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
             controller.sink.commands,
             [
                 "RESPAWN_PLAYER_PRACTICE_BRAKED "
-                "racer false 10 20 0 1 31.5 8 7",
+                "racer false 10 20 0 1 31.5 8 3",
             ],
         )
         await cancel_tasks(controller)
@@ -322,7 +322,7 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         await controller._command_respawn(player, kill_first=True)
 
         self.assertIn(
-            "RESPAWN_PLAYER_BRAKED racer false 3 4 0 1 7",
+            "RESPAWN_PLAYER_BRAKED racer false 3 4 0 1 3",
             controller.sink.commands,
         )
         self.assertFalse(
