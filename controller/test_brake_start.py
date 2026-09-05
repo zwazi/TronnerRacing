@@ -75,7 +75,7 @@ async def cancel_player_tasks(controller, player):
 
 
 class StartModeTests(unittest.IsolatedAsyncioTestCase):
-    def test_engine_uses_stock_brake_protocol_without_decay_override(self):
+    def test_engine_uses_explicit_brake_down_without_turn_or_focus_release(self):
         root = Path(__file__).resolve().parents[1]
         engine_patch = "\n".join(
             path.read_text(encoding="utf-8")
@@ -84,32 +84,57 @@ class StartModeTests(unittest.IsolatedAsyncioTestCase):
                 root / "engine/patches/start-zone-lifecycle.patch",
             )
         )
+        lifecycle_patch = (
+            root / "engine/patches/start-zone-lifecycle.patch"
+        ).read_text(encoding="utf-8")
 
         self.assertIn('"RESPAWN_PLAYER_BRAKED"', engine_patch)
         self.assertIn('"RESPAWN_PLAYER_CHECKPOINT_BRAKED"', engine_patch)
         self.assertIn('"RESPAWN_PLAYER_PRACTICE_BRAKED"', engine_patch)
-        start_braked = engine_patch.split(
-            "+void gCycle::StartBraked(REAL releaseAfterSeconds)", 1
-        )[1].split("+void gCycle::RestoreCheckpointState", 1)[0]
-        self.assertIn("+    braking = 1;", start_braked)
-        self.assertIn("+    startBrakeReleaseSpeed_ = verletSpeed_;", start_braked)
-        self.assertNotIn("sg_AcquireClientZeroAcceleration", start_braked)
+        self.assertIn("-    braking = 1;", lifecycle_patch)
+        self.assertIn("+    braking = 0;", lifecycle_patch)
+        self.assertIn(
+            "freezeClientZeroAcceleration_ = "
+            "sg_AcquireClientZeroAcceleration(Owner())",
+            lifecycle_patch,
+        )
+        self.assertIn(
+            "(startBraked_ ||",
+            lifecycle_patch,
+        )
+        self.assertIn(
+            "sg_ReleaseClientZeroAcceleration(Owner())", lifecycle_patch
+        )
         self.assertIn("startHoldInitialWinding_", engine_patch)
         self.assertIn("five left on eight axes counts as three turns", engine_patch)
         self.assertIn(
             "if (destination.braking && !freezeBrakeActionDown_)", engine_patch
         )
+        self.assertIn("lastTime = releaseTime;", lifecycle_patch)
+        self.assertNotIn(
+            "+                gCycleMovement::TimestepCore(releaseTime",
+            lifecycle_patch,
+        )
 
-    def test_private_zone_lifetime_resets_in_place_for_each_cycle(self):
+    def test_private_zone_lifetime_tracks_the_actual_run_start(self):
         root = Path(__file__).resolve().parents[1]
         lifecycle_patch = (
             root / "engine/patches/start-zone-lifecycle.patch"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("sg_ResetPrivateZonesForUser(p->Owner())", lifecycle_patch)
+        self.assertIn(
+            "sg_ResetPrivateZonesForUser(p->Owner(), true)", lifecycle_patch
+        )
+        self.assertIn(
+            "sg_ResetPrivateZonesForUser(Owner(), false)", lifecycle_patch
+        )
+        self.assertIn(
+            "sg_ResetPrivateZonesForUser(Owner(), true)", lifecycle_patch
+        )
         self.assertIn("SetRadius(privateInitialRadius_)", lifecycle_patch)
         self.assertIn(
-            "SetExpansionSpeed(privateInitialExpansionSpeed_)", lifecycle_patch
+            "SetExpansionSpeed(startGrowth ? privateInitialExpansionSpeed_ : 0)",
+            lifecycle_patch,
         )
         self.assertIn("RequestSync(privateUser_, true)", lifecycle_patch)
         self.assertNotIn("new gZone", lifecycle_patch)
