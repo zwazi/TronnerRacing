@@ -11,15 +11,22 @@
 /ghost off
 ```
 
-`/ghost` defaults to PB. PB uses the requester's best time, WR uses rank 1, and
-rank/name selectors use the current map's leaderboard. A selection starts with
-the requester's next attempt and remains active until it is disabled, the map
-changes, or the requester disconnects. The controller prefers the exact replay
-for the selected leaderboard time. If that time predates input capture, it uses
-the player's fastest available full-run replay and states both the replay and
-ranked times in the confirmation. When a new finish changes an active PB, WR,
-rank, or named-player selection, the controller reloads that selection for the
-requester and uses the updated ghost on their next attempt.
+`/ghost` defaults to PB. PB uses the requester's best finish. Before their first
+finish, it uses the unfinished replay that came closest to the winzone according
+to the route-progress field, replacing it whenever a later attempt gets closer.
+Once the player finishes, unfinished attempts are no longer PB candidates. WR
+uses rank 1, and rank/name selectors use the current map's leaderboard. PB and
+rank-number preferences persist between rounds and reconnects until replaced or
+disabled with `/ghost off`; they are resolved against each new map before the
+player's next spawn. WR and named-player selections apply only to the current
+round.
+
+The controller prefers the exact replay for a selected leaderboard time. If that
+time predates input capture, it uses the player's fastest available full-run
+replay and states both the replay and ranked times in the confirmation. When a
+new run changes an active PB, WR, rank, or named-player selection, the controller
+reloads that selection for the requester and uses the updated ghost on their
+next attempt.
 
 Historical resource names and revisions remain eligible. A strict XML and
 settings comparison is used to choose the verified coordinate conversion when
@@ -72,9 +79,10 @@ the existing player descriptor 201 and cycle descriptor 320 used by unmodified
 0.2.8 clients. A wire-only negative cycle distance prevents legacy clients from
 predicting a wall for the ghost. Because 0.2.8 has no translucent-cycle protocol,
 the compatibility rendering is an ordinary cyan cycle named for the selected
-slot. Ghost names use `#[rank] - [Player name] Ghost`; the player-name portion is
-truncated as needed so the complete ASCII name is at most 15 visible bytes, the
-safe limit for 0.2.8's 16-character NUL-terminated player-name storage.
+player. A player's own PB ghost is named `PB`; other ghosts use only the replay
+player's name. Names are converted to ASCII and truncated as needed to at most
+15 visible bytes, the safe limit for 0.2.8's 16-character NUL-terminated
+player-name storage.
 
 Visibility is filtered per network connection. Other clients receive neither
 the ghost player nor its cycle. Multiple local players using one split-screen

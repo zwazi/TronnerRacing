@@ -79,6 +79,13 @@ GHOST_LEGACY_NAME_BYTES = 15
 GHOST_NON_PHYSICS_REPLAY_SETTINGS = frozenset(
     {b"PING_CHARITY_SERVER", b"SERVER_OPTIONS"}
 )
+# Historical ghosts remain useful when this grind-depth safeguard changes.
+# Ghost plans are private, non-colliding playback objects, and current plans
+# restore authoritative cycle state at turns, so this difference must not make
+# a previously captured run unavailable.
+GHOST_TOLERATED_PHYSICS_REPLAY_SETTINGS = frozenset(
+    {b"CYCLE_RUBBER_MINDISTANCE_UNPREPARED"}
+)
 GHOST_SPATIAL_MAP_ATTRIBUTES = frozenset(
     {"x", "y", "radius", "growth", "destX", "destY"}
 )
@@ -166,6 +173,23 @@ def normalize_start_preference(value: object) -> str | None:
         if seconds == DEFAULT_START_COUNTDOWN_SECONDS
         else f"countdown {seconds}"
     )
+
+
+def normalize_ghost_preference(value: object) -> str | None:
+    """Return the durable subset of ghost selectors in canonical form."""
+    parts = plain_console_text(value).strip().casefold().split()
+    if not parts:
+        return "pb"
+    if parts[0] in {"pb", "personal", "personalbest"} and len(parts) == 1:
+        return "pb"
+    if len(parts) == 1 and parts[0].isdigit():
+        rank_text = parts[0]
+    elif len(parts) == 2 and parts[0] == "rank" and parts[1].isdigit():
+        rank_text = parts[1]
+    else:
+        return None
+    rank = int(rank_text)
+    return f"rank {rank}" if rank > 0 else None
 
 
 def start_preference_details(value: object) -> tuple[str, int, str]:
@@ -340,20 +364,12 @@ def ghost_map_geometry(path: Path, size_factor: float) -> tuple | None:
         return None
 
 
-def ghost_display_name(rank: int, username: object) -> str:
-    """Build the requested rank/name label within the 0.2.8 name limit."""
-    rank_text = str(max(1, int(rank)))
-    prefix = f"#{rank_text} - "
-    suffix = " Ghost"
+def ghost_display_name(username: object, personal_best: bool = False) -> str:
+    """Build a plain player/PB label within the 0.2.8 name limit."""
+    if personal_best:
+        return "PB"
     player_bytes = plain_console_text(username).encode("ascii", "replace")
-    available = GHOST_LEGACY_NAME_BYTES - len(prefix) - len(suffix)
-    if available > 0:
-        player_name = player_bytes[:available].decode("ascii") or "?"
-        return prefix + player_name + suffix
-    # This is only reachable at implausibly large ranks, but retain both the
-    # rank marker and Ghost suffix while honoring the legacy wire limit.
-    compact_rank = rank_text[: GHOST_LEGACY_NAME_BYTES - len("# Ghost")]
-    return f"#{compact_rank} Ghost"
+    return player_bytes[:GHOST_LEGACY_NAME_BYTES].decode("ascii") or "?"
 
 
 def clean_console_text(value: object) -> str:
@@ -1856,22 +1872,9 @@ class Player:
     attempt_number: int = 0
     respawn_enabled: bool = True
     is_ai: bool = False
-    last_activity_monotonic: float | None = None
+    last_turn_monotonic: float | None = None
     afk: bool = False
-    last_activity_position: tuple[float, float] | None = None
-    activity_cycle_alive: bool = False
     activity_snapshot_seen: bool = False
-    activity_run_samples: collections.deque[tuple[float, float, float]] = (
-        dataclasses.field(default_factory=collections.deque)
-    )
-    activity_area_samples: collections.deque[tuple[float, float, float]] = (
-        dataclasses.field(default_factory=collections.deque)
-    )
-    afk_recovery_samples: collections.deque[tuple[float, float, float]] = (
-        dataclasses.field(default_factory=collections.deque)
-    )
-    passive_death_streak: int = 0
-    dead_since_monotonic: float | None = None
     suspended_votes: dict[str, int] = dataclasses.field(default_factory=dict)
     start_mode: str = "immediate"
     start_countdown_seconds: int = DEFAULT_START_COUNTDOWN_SECONDS
@@ -1958,6 +1961,7 @@ class ReplayCapture:
     checkpoint_spawn: bool
     initial_distance: float = 0.0
     latest_distance: float = 0.0
+    closest_winzone_distance: float | None = None
     record_key: str = ""
     storage_path: str = ""
     settings_identifier: str | None = None
@@ -2089,6 +2093,8 @@ class GhostReplay:
     event_states: tuple[ReplayEventState | None, ...] = ()
     settings_identifier: str | None = None
     settings_identifiers: tuple[str, ...] = ()
+    finished: bool = True
+    closest_winzone_distance: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2246,7 +2252,8 @@ class StateStore:
                 personal_best INTEGER NOT NULL,
                 event_count INTEGER NOT NULL,
                 format_version INTEGER NOT NULL,
-                input_data BLOB NOT NULL
+                input_data BLOB NOT NULL,
+                closest_winzone_distance REAL
             );
             CREATE INDEX IF NOT EXISTS replay_runs_by_player
                 ON replay_runs(player_ref, recorded_at DESC);
@@ -2343,6 +2350,16 @@ class StateStore:
                 "ALTER TABLE replay_runs ADD COLUMN turns_driven INTEGER "
                 "NOT NULL DEFAULT 0"
             )
+        if "closest_winzone_distance" not in replay_run_columns:
+            self.connection.execute(
+                "ALTER TABLE replay_runs ADD COLUMN closest_winzone_distance REAL"
+            )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS replay_runs_unfinished_progress "
+            "ON replay_runs(player_ref, map_ref, closest_winzone_distance) "
+            "WHERE outcome IN (0, 3) AND checkpoint_spawn=0 "
+            "AND closest_winzone_distance IS NOT NULL"
+        )
         replay_map_columns = {
             row[1] for row in self.connection.execute("PRAGMA table_info(replay_maps)")
         }
@@ -2363,7 +2380,8 @@ class StateStore:
     @staticmethod
     def _replay_death_counts(reason: str) -> tuple[int, int]:
         """Classify public racing deaths without counting administrative kills."""
-        kind = str(reason or "").strip().split(maxsplit=1)[0].upper()
+        parts = str(reason or "").strip().split(maxsplit=1)
+        kind = parts[0].upper() if parts else ""
         if kind in {"DEATHZONE", "DEATHZONE_TEAM"}:
             return 0, 1
         if kind in {
@@ -2780,10 +2798,13 @@ class StateStore:
         *,
         ignore_size_factor: bool = False,
     ) -> bool:
-        """Compare replay settings while excluding non-simulation metadata."""
+        """Compare replay settings while excluding tolerated ghost differences."""
         if recorded_identifier == active_identifier:
             return True
-        ignored_settings = GHOST_NON_PHYSICS_REPLAY_SETTINGS
+        ignored_settings = (
+            GHOST_NON_PHYSICS_REPLAY_SETTINGS
+            | GHOST_TOLERATED_PHYSICS_REPLAY_SETTINGS
+        )
         if ignore_size_factor:
             ignored_settings = ignored_settings | {b"SIZE_FACTOR"}
         rows = self.current_connection().execute(
@@ -2914,8 +2935,9 @@ class StateStore:
             "release_offset_us, start_x, start_y, start_xdir, start_ydir, "
             "start_speed, initial_turns, size_factor, start_mode, checkpoint_spawn, settings_ref, "
             "outcome, death_reason, finish_seconds, finish_turns, personal_best, "
-            "event_count, format_version, input_data, distance_meters, turns_driven"
-            ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "event_count, format_version, input_data, distance_meters, turns_driven, "
+            "closest_winzone_distance"
+            ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 map_ref,
                 player_ref,
@@ -2943,6 +2965,7 @@ class StateStore:
                 sqlite3.Binary(blob),
                 distance_meters,
                 turns_driven,
+                capture.closest_winzone_distance,
             ),
         )
         run_ref = int(cursor.lastrowid)
@@ -3108,6 +3131,35 @@ class StateStore:
         map_keys: Iterable[str] = (),
     ) -> tuple[GhostReplay, ...]:
         """Return ranked-first full-run replay candidates for one player."""
+        return self._ghost_replays_for_player(
+            record_key,
+            record.identity_key,
+            map_keys,
+            ranked_record=record,
+        )
+
+    def ghost_replays_for_unfinished_pb(
+        self,
+        record_key: str,
+        identity_key: str,
+        map_keys: Iterable[str] = (),
+    ) -> tuple[GhostReplay, ...]:
+        """Return closest-to-winzone unfinished replay candidates."""
+        return self._ghost_replays_for_player(
+            record_key,
+            identity_key,
+            map_keys,
+            ranked_record=None,
+        )
+
+    def _ghost_replays_for_player(
+        self,
+        record_key: str,
+        identity_key: str,
+        map_keys: Iterable[str],
+        *,
+        ranked_record: Record | None,
+    ) -> tuple[GhostReplay, ...]:
         connection = self.current_connection()
         requested_map_keys = sorted(
             {
@@ -3117,42 +3169,62 @@ class StateStore:
             }
         )
         placeholders = ",".join("?" for _ in requested_map_keys)
-        rows = connection.execute(
+        select = (
             "SELECT replay_runs.id, replay_players.identity_key, "
-            "replay_players.username, replay_runs.finish_seconds, "
-            "replay_runs.finish_turns, replay_runs.start_x, replay_runs.start_y, "
-            "replay_runs.start_xdir, replay_runs.start_ydir, "
-            "replay_runs.start_speed, replay_runs.initial_turns, "
-            "replay_runs.size_factor, replay_runs.release_offset_us, "
-            "replay_runs.input_data, replay_settings.server_identifier, "
-            "replay_maps.resource_key, replay_maps.map_identifier, "
-            "replay_maps.revision_identifier "
-            "FROM replay_runs "
+            "replay_players.username, {duration}, replay_runs.finish_turns, "
+            "replay_runs.start_x, replay_runs.start_y, replay_runs.start_xdir, "
+            "replay_runs.start_ydir, replay_runs.start_speed, "
+            "replay_runs.initial_turns, replay_runs.size_factor, "
+            "replay_runs.release_offset_us, replay_runs.input_data, "
+            "replay_settings.server_identifier, replay_maps.resource_key, "
+            "replay_maps.map_identifier, replay_maps.revision_identifier, "
+            "replay_runs.closest_winzone_distance FROM replay_runs "
             "JOIN replay_players ON replay_players.id=replay_runs.player_ref "
             "JOIN replay_maps ON replay_maps.id=replay_runs.map_ref "
             "LEFT JOIN replay_settings ON replay_settings.id=replay_runs.settings_ref "
             f"WHERE (replay_maps.record_key IN ({placeholders}) OR "
             f"replay_maps.resource_key IN ({placeholders})) "
-            "AND replay_players.identity_key=? AND replay_runs.outcome=1 "
+            "AND replay_players.identity_key=? "
             "AND replay_runs.checkpoint_spawn=0 "
             "AND replay_runs.format_version=? "
-            "ORDER BY CASE WHEN replay_runs.finish_seconds=? AND "
-            "(replay_runs.finish_turns=? OR (replay_runs.finish_turns IS NULL "
-            "AND ? IS NULL)) THEN 0 ELSE 1 END, "
-            "replay_runs.finish_seconds ASC, replay_runs.finish_turns IS NULL, "
-            "replay_runs.finish_turns ASC, replay_runs.recorded_at DESC, "
-            "replay_runs.id DESC LIMIT ?",
-            (
-                *requested_map_keys,
-                *requested_map_keys,
-                record.identity_key,
-                REPLAY_FORMAT_VERSION,
-                record.best_seconds,
-                record.best_turns,
-                record.best_turns,
-                GHOST_REPLAY_CANDIDATE_LIMIT,
-            ),
-        ).fetchall()
+        )
+        common_parameters = (
+            *requested_map_keys,
+            *requested_map_keys,
+            identity_key,
+            REPLAY_FORMAT_VERSION,
+        )
+        if ranked_record is not None:
+            rows = connection.execute(
+                select.format(duration="replay_runs.finish_seconds")
+                + "AND replay_runs.outcome=1 "
+                "ORDER BY CASE WHEN replay_runs.finish_seconds=? AND "
+                "(replay_runs.finish_turns=? OR (replay_runs.finish_turns IS NULL "
+                "AND ? IS NULL)) THEN 0 ELSE 1 END, "
+                "replay_runs.finish_seconds ASC, replay_runs.finish_turns IS NULL, "
+                "replay_runs.finish_turns ASC, replay_runs.recorded_at DESC, "
+                "replay_runs.id DESC LIMIT ?",
+                (
+                    *common_parameters,
+                    ranked_record.best_seconds,
+                    ranked_record.best_turns,
+                    ranked_record.best_turns,
+                    GHOST_REPLAY_CANDIDATE_LIMIT,
+                ),
+            ).fetchall()
+        else:
+            duration = (
+                "MAX(0.001, replay_runs.ended_at - replay_runs.recorded_at - "
+                "COALESCE(replay_runs.release_offset_us, 0) / 1000000.0)"
+            )
+            rows = connection.execute(
+                select.format(duration=duration)
+                + "AND replay_runs.outcome IN (0, 3) "
+                "AND replay_runs.closest_winzone_distance IS NOT NULL "
+                "ORDER BY replay_runs.closest_winzone_distance ASC, "
+                "replay_runs.recorded_at DESC, replay_runs.id DESC LIMIT ?",
+                (*common_parameters, GHOST_REPLAY_CANDIDATE_LIMIT),
+            ).fetchall()
         replays: list[GhostReplay] = []
         for row in rows:
             finish_seconds = float(row[3])
@@ -3264,6 +3336,10 @@ class StateStore:
                     event_states=normalized_states,
                     settings_identifier=settings_identifier,
                     settings_identifiers=settings_identifiers,
+                    finished=ranked_record is not None,
+                    closest_winzone_distance=(
+                        float(row[18]) if row[18] is not None else None
+                    ),
                 )
             )
         return tuple(replays)
@@ -5319,14 +5395,32 @@ class TronnerRacing:
             )
             if isinstance(enabled, bool)
         }
-        saved_ghost_selections = self.store.get_json("ghost_selections", {})
-        self._saved_ghost_selections: dict[str, object] = (
-            dict(saved_ghost_selections)
-            if isinstance(saved_ghost_selections, dict)
-            else {}
+        saved_ghost_preferences = self.store.get_json("ghost_preferences", {})
+        self.ghost_preferences: dict[str, str] = {}
+        for identity_key, raw_preference in (
+            saved_ghost_preferences.items()
+            if isinstance(saved_ghost_preferences, dict)
+            else ()
+        ):
+            preference = normalize_ghost_preference(raw_preference)
+            if preference is not None:
+                self.ghost_preferences[str(identity_key)] = preference
+        # Migrate the persistent selectors saved by the old map-scoped format.
+        legacy_ghost_selections = self.store.get_json("ghost_selections", {})
+        legacy_items = (
+            legacy_ghost_selections.get("selections", {}).items()
+            if isinstance(legacy_ghost_selections, dict)
+            and isinstance(legacy_ghost_selections.get("selections"), dict)
+            else ()
         )
-        # Saved selections are restored only after the current map and online
-        # players have been reconstructed from the live engine state.
+        for identity_key, raw_state in legacy_items:
+            if not isinstance(raw_state, dict):
+                continue
+            preference = normalize_ghost_preference(raw_state.get("selector"))
+            if preference is not None:
+                self.ghost_preferences.setdefault(str(identity_key), preference)
+        self.store.set_json("ghost_preferences", self.ghost_preferences)
+        self.store.set_json("ghost_selections", {})
         self.ghost_selections: dict[str, dict[str, object]] = {}
         self.ghost_selection_map_key = ""
         self.spawn_preferences_path = Path(
@@ -5665,7 +5759,7 @@ class TronnerRacing:
         self._migrate_spawn_preferences()
         self._reconcile_rotation()
         self._restore_runtime_context()
-        self._restore_ghost_selections()
+        await self._restore_persistent_ghosts_for_round()
         if self.transitioning:
             self._schedule_transition_watchdog(self.transition_target_key)
         if start_http:
@@ -5728,68 +5822,48 @@ class TronnerRacing:
         except Exception:
             LOG.exception("background map-review reconciliation failed")
 
-    def _save_ghost_selections(self) -> None:
-        current = getattr(self, "current", None)
-        map_key = map_records_key(current) if current is not None else ""
-        self.ghost_selection_map_key = map_key
+    def _save_ghost_preferences(self) -> None:
         self.store.set_json(
-            "ghost_selections",
-            {
-                "mapKey": map_key,
-                "selections": getattr(self, "ghost_selections", {}),
-            },
+            "ghost_preferences", getattr(self, "ghost_preferences", {})
         )
 
-    def _restore_ghost_selections(self) -> None:
-        saved = getattr(self, "_saved_ghost_selections", {})
-        current = getattr(self, "current", None)
-        current_key = map_records_key(current) if current is not None else ""
-        saved_key = str(saved.get("mapKey") or "") if isinstance(saved, dict) else ""
-        raw_selections = saved.get("selections", {}) if isinstance(saved, dict) else {}
-        restored: dict[str, dict[str, object]] = {}
-        if saved and not current_key:
-            # CURRENT_MAP may arrive just after startup. Keep the durable state
-            # pending until the engine identifies the map instead of erasing it.
-            self.ghost_selection_map_key = saved_key
-            return
-        if saved_key and saved_key == current_key and isinstance(raw_selections, dict):
-            for identity_key, raw_state in raw_selections.items():
-                if not isinstance(raw_state, dict):
-                    continue
-                selector = plain_console_text(raw_state.get("selector", ""))[:128]
-                try:
-                    run_id = int(raw_state.get("runId", 0))
-                    rank = int(raw_state.get("rank", 0))
-                except (TypeError, ValueError):
-                    continue
-                record_identity = str(raw_state.get("recordIdentityKey") or "")
-                if selector and run_id > 0 and rank > 0 and record_identity:
-                    restored[str(identity_key)] = {
-                        "selector": selector,
-                        "runId": run_id,
-                        "rank": rank,
-                        "recordIdentityKey": record_identity,
-                        "ghostName": plain_console_text(
-                            raw_state.get("ghostName", "")
-                        )[:GHOST_LEGACY_NAME_BYTES],
-                    }
-        self.ghost_selections = restored
-        self.ghost_selection_map_key = current_key if restored else ""
-        self._saved_ghost_selections = {}
-        if saved and not restored:
-            self._save_ghost_selections()
-
     def _clear_ghost_selections(self) -> None:
+        """Clear resolved plans for a map while retaining player preferences."""
         self.ghost_selections = {}
-        self._save_ghost_selections()
+        self.ghost_selection_map_key = ""
 
     def _move_ghost_selection(self, old_identity: str, new_identity: str) -> None:
         selections = getattr(self, "ghost_selections", {})
-        if old_identity == new_identity or old_identity not in selections:
+        if old_identity == new_identity:
             return
-        state = selections.pop(old_identity)
-        selections.setdefault(new_identity, state)
-        self._save_ghost_selections()
+        if old_identity in selections:
+            state = selections.pop(old_identity)
+            selections.setdefault(new_identity, state)
+        preferences = getattr(self, "ghost_preferences", {})
+        if old_identity in preferences:
+            preference = preferences.pop(old_identity)
+            preferences.setdefault(new_identity, preference)
+            self._save_ghost_preferences()
+
+    async def _restore_persistent_ghosts_for_round(self) -> None:
+        if (
+            not getattr(self, "current", None)
+            or not getattr(self, "round_active", False)
+            or getattr(self, "transitioning", False)
+        ):
+            return
+        seen_players: set[int] = set()
+        for player in list(getattr(self, "players", {}).values()):
+            if id(player) in seen_players or not player.connected or player.is_ai:
+                continue
+            seen_players.add(id(player))
+            selector = getattr(self, "ghost_preferences", {}).get(
+                player.identity_key
+            )
+            if selector:
+                await self._command_ghost(
+                    player, selector, automatic=True, silent=True
+                )
 
     def _restore_runtime_context(self) -> None:
         """Recover non-record state when the controller restarts mid-round."""
@@ -7795,8 +7869,8 @@ class TronnerRacing:
                 "alive": bool(player.alive),
                 "afk": bool(player.afk),
                 "activityAgeSeconds": round(
-                    max(0.0, now_monotonic - player.last_activity_monotonic), 1
-                ) if player.last_activity_monotonic is not None else None,
+                    max(0.0, now_monotonic - player.last_turn_monotonic), 1
+                ) if player.last_turn_monotonic is not None else None,
             }
             for player in unique_players
         ]
@@ -8798,6 +8872,7 @@ class TronnerRacing:
             self._complete_map_transition()
         if not round_was_active:
             self._begin_helpful_message_round()
+        await self._restore_persistent_ghosts_for_round()
         for player in self.players.values():
             if (
                 player.connected
@@ -8873,6 +8948,13 @@ class TronnerRacing:
                 if player:
                     self._publish_player_audit("login", player)
                     await self._deliver_saved_player_messages(player)
+                    selector = getattr(self, "ghost_preferences", {}).get(
+                        player.identity_key
+                    )
+                    if selector:
+                        await self._command_ghost(
+                            player, selector, automatic=True, silent=True
+                        )
             elif event == "PLAYER_LOGOUT":
                 parts = payload.split()
                 player = self.player_for(parts[0]) if parts else None
@@ -8900,7 +8982,6 @@ class TronnerRacing:
             elif event == "PLAYER_COLORED_NAME":
                 self._handle_player_colored_name(payload)
             elif event == "CHAT":
-                await self._handle_player_activity(payload)
                 parts = payload.split(maxsplit=1)
                 if len(parts) == 2:
                     player = self.player_for(parts[0])
@@ -9028,8 +9109,6 @@ class TronnerRacing:
         self.current = entry
         if previous_key and previous_key != entry.key:
             self._clear_ghost_selections()
-        if getattr(self, "_saved_ghost_selections", {}):
-            self._restore_ghost_selections()
         if getattr(self, "current_map_selection", {}).get("resourcePath") != entry.key:
             self.next_map_selection = self._selection_for_map(
                 entry, queued_via="native"
@@ -9101,11 +9180,7 @@ class TronnerRacing:
             # state silently so entering or leaving spectate never produces an
             # AFK status announcement.
             player.afk = False
-            player.dead_since_monotonic = None
-            player.passive_death_streak = 0
-            player.activity_run_samples.clear()
-            player.activity_area_samples.clear()
-            player.afk_recovery_samples.clear()
+            player.last_turn_monotonic = None
             self.finalists.discard(id(player))
             self._cancel_player_freeze(player)
             if clear_center:
@@ -9138,8 +9213,16 @@ class TronnerRacing:
         # spectator mode or entering the grid marks the player active,
         # re-enables respawning, and schedules their first spawn immediately
         # through this same path.
-        await self._record_player_activity(player)
+        if player.active and player.last_turn_monotonic is None:
+            # A newly eligible racer gets one timeout window in which to make
+            # their first turn.
+            player.last_turn_monotonic = time.monotonic()
         await self._resolve_votes_after_eligibility_change()
+        selector = getattr(self, "ghost_preferences", {}).get(player.identity_key)
+        if selector:
+            await self._command_ghost(
+                player, selector, automatic=True, silent=True
+            )
         if (
             player.active
             and self.round_active
@@ -9161,7 +9244,6 @@ class TronnerRacing:
         if player:
             if player.identity_key in getattr(self, "ghost_selections", {}):
                 self.ghost_selections.pop(player.identity_key, None)
-                self._save_ghost_selections()
             self.online_snapshot_misses.pop(id(player), None)
             player.connected = False
             player.active = False
@@ -9175,14 +9257,8 @@ class TronnerRacing:
             getattr(self, "skip_votes", set()).discard(player.identity_key)
             player.suspended_votes.clear()
             player.afk = False
-            player.last_activity_position = None
-            player.activity_cycle_alive = False
+            player.last_turn_monotonic = None
             player.activity_snapshot_seen = False
-            player.dead_since_monotonic = None
-            player.passive_death_streak = 0
-            player.activity_run_samples.clear()
-            player.activity_area_samples.clear()
-            player.afk_recovery_samples.clear()
 
     def _handle_player_login(self, payload: str) -> Player | None:
         parts = payload.split(maxsplit=1)
@@ -9242,16 +9318,11 @@ class TronnerRacing:
         if player:
             previous_identity = player.identity_key
             player.auth_name = None
-            self._move_ghost_selection(previous_identity, player.identity_key)
+            selections = getattr(self, "ghost_selections", {})
+            if previous_identity in selections:
+                state = selections.pop(previous_identity)
+                selections.setdefault(player.identity_key, state)
         return player
-
-    async def _handle_player_activity(self, payload: str) -> None:
-        parts = payload.split(maxsplit=1)
-        if not parts:
-            return
-        player = self.player_for(parts[0])
-        if player and player.connected and not player.is_ai:
-            await self._record_player_activity(player)
 
     def _handle_player_renamed(self, payload: str) -> Player | None:
         parts = payload.split(maxsplit=4)
@@ -9322,6 +9393,31 @@ class TronnerRacing:
             player.connected = True
             self.online_snapshot_misses.pop(id(player), None)
             player.alive = alive
+
+    def _record_replay_route_progress(
+        self,
+        capture: ReplayCapture,
+        position: tuple[float, float],
+    ) -> None:
+        """Remember the smallest route-field distance reached by this run."""
+        current = getattr(self, "current", None)
+        model = getattr(self, "final_countdown_route_model", None)
+        if (
+            current is None
+            or model is None
+            or current.key != capture.resource_key
+            or current.key != getattr(self, "final_countdown_route_map_key", None)
+        ):
+            return
+        try:
+            route_distance = float(model.distance_at(position))
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not math.isfinite(route_distance) or route_distance < 0:
+            return
+        previous = capture.closest_winzone_distance
+        if previous is None or route_distance < previous:
+            capture.closest_winzone_distance = route_distance
 
     def _handle_replay_begin(self, payload: str) -> None:
         parts = payload.split()
@@ -9394,6 +9490,7 @@ class TronnerRacing:
         )
         self.replay_captures[token] = capture
         self.active_replay_tokens[id(player)] = token
+        self._record_replay_route_progress(capture, (x, y))
 
     @staticmethod
     def _decode_replay_setting_hex(value: str) -> bytes:
@@ -9508,6 +9605,7 @@ class TronnerRacing:
             distance=distance,
             released=state_kind == "release",
         )
+        self._record_replay_route_progress(capture, (x, y))
         player = self.player_for(capture.player_log_name)
         if player is None:
             return
@@ -9572,6 +9670,7 @@ class TronnerRacing:
                     speed,
                     turns,
                 )
+                self._record_replay_route_progress(capture, (x, y))
         added = (
             capture.add_input(game_time, action, state)
             if state is not None
@@ -9582,6 +9681,7 @@ class TronnerRacing:
         player = self.player_for(capture.player_log_name)
         if player and action in {"L", "R"}:
             self._observe_cycle_turn(player, action)
+            await self._record_player_turn(player)
         if action not in {"L", "R"}:
             return
         if (
@@ -9672,7 +9772,13 @@ class TronnerRacing:
             0.0, end_game_time - capture.spawn_game_time
         )
         saved = self._persist_replay_capture(capture, ended_at)
-        if saved and capture.outcome == "finish":
+        if saved and (
+            capture.outcome == "finish"
+            or (
+                capture.outcome in {"death", "round_end"}
+                and capture.closest_winzone_distance is not None
+            )
+        ):
             await self._refresh_ghost_selections(
                 capture.record_key or capture.resource_key
             )
@@ -9703,11 +9809,7 @@ class TronnerRacing:
         player.practice_attempt_tainted = self._practice_active(player)
         was_active = player.active
         player.alive = True
-        player.dead_since_monotonic = None
         player.activity_snapshot_seen = False
-        player.activity_cycle_alive = True
-        player.activity_run_samples.clear()
-        player.afk_recovery_samples.clear()
         if self._practice_active(player):
             player.practice_samples.clear()
             player.practice_respawn_snapshot = None
@@ -9719,10 +9821,6 @@ class TronnerRacing:
             player.cycle_ydir = ydir
             player.cycle_speed = 0.0
             player.cycle_turns = 0
-            now = time.monotonic()
-            player.last_activity_position = position
-            player.activity_run_samples.append((now, *position))
-            player.activity_area_samples.append((now, *position))
         if player.is_ai:
             player.active = True
             return
@@ -9828,8 +9926,6 @@ class TronnerRacing:
             event_time = float(parts[-1])
         except ValueError:
             return
-        if not player.afk:
-            player.last_activity_monotonic = time.monotonic()
         respawn_kind = player.pending_respawn_kind
         if (
             respawn_kind != "checkpoint"
@@ -9882,19 +9978,6 @@ class TronnerRacing:
             # This is the old cycle disappearing after its replacement command
             # was queued; CYCLE_CREATED has not confirmed the held cycle yet.
             return
-        now = time.monotonic()
-        player.dead_since_monotonic = now
-        if self._activity_run_looks_passive(player):
-            player.passive_death_streak += 1
-        elif player.activity_run_samples:
-            player.passive_death_streak = 0
-        player.activity_run_samples.clear()
-        player.afk_recovery_samples.clear()
-        passive_death_limit = max(
-            2, int(self.config.get("afk_straight_death_limit", 4))
-        )
-        if player.passive_death_streak >= passive_death_limit:
-            await self._set_player_afk(player)
         player.checkpoints_collected.clear()
         player.checkpoint_notice_monotonic = None
         if held_cycle_destroyed:
@@ -10375,7 +10458,6 @@ class TronnerRacing:
                     ),
                     no_cp_elapsed=player.no_cp_elapsed,
                 )
-        await self._record_player_activity(player)
         await self.sink.send(
             f"SET_CHECKPOINT_PLAYER_COLOR {player.target} {checkpoint_id}"
         )
@@ -10398,7 +10480,6 @@ class TronnerRacing:
             # kill/respawn loop. Completed finishes mark the player dead below,
             # so their repeated zone ticks are already rejected above.
             return
-        await self._record_player_activity(player)
         practice_finish = (
             self._practice_active(player)
             or player.practice_attempt_tainted
@@ -10854,19 +10935,14 @@ class TronnerRacing:
             return
         await self._resolve_extend_vote()
 
-    async def _record_player_activity(
+    async def _record_player_turn(
         self,
         player: Player,
-        activity_time: float | None = None,
+        turn_time: float | None = None,
     ) -> None:
-        activity_time = time.monotonic() if activity_time is None else activity_time
-        player.last_activity_monotonic = activity_time
-        player.dead_since_monotonic = (
-            activity_time if player.active and not player.alive else None
+        player.last_turn_monotonic = (
+            time.monotonic() if turn_time is None else turn_time
         )
-        player.passive_death_streak = 0
-        player.activity_area_samples.clear()
-        player.afk_recovery_samples.clear()
         if not player.afk:
             return
         player.afk = False
@@ -10888,7 +10964,6 @@ class TronnerRacing:
         ):
             return
         player.afk = True
-        player.afk_recovery_samples.clear()
         suspended = self._suspend_player_votes(player)
         await self.broadcast(
             f"{player.record_name} is now AFK and does not count toward votes."
@@ -10899,167 +10974,20 @@ class TronnerRacing:
     async def _check_afk_players(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         timeout = max(1.0, float(self.config.get("afk_timeout_seconds", 60)))
-        dead_timeout = max(
-            1.0,
-            float(self.config.get("afk_dead_timeout_seconds", timeout)),
-        )
         players = {
             id(item): item for item in getattr(self, "players", {}).values()
         }.values()
         for player in players:
-            idle_since = (
-                player.last_activity_monotonic
-                if player.alive
-                else player.dead_since_monotonic
-                if player.dead_since_monotonic is not None
-                else player.last_activity_monotonic
-            )
             if (
                 player.connected
                 and player.active
                 and player.respawn_enabled
                 and not player.is_ai
                 and not player.afk
-                and idle_since is not None
-                and now - idle_since >= (timeout if player.alive else dead_timeout)
+                and player.last_turn_monotonic is not None
+                and now - player.last_turn_monotonic >= timeout
             ):
                 await self._set_player_afk(player)
-
-    @staticmethod
-    def _activity_trajectory(
-        samples: collections.deque[tuple[float, float, float]],
-    ) -> tuple[float, float, float, float]:
-        """Return duration, travelled distance, displacement, and total turn."""
-        if len(samples) < 2:
-            return 0.0, 0.0, 0.0, 0.0
-        duration = max(0.0, samples[-1][0] - samples[0][0])
-        path = 0.0
-        vectors: list[tuple[float, float]] = []
-        sample_list = list(samples)
-        for previous, current in zip(sample_list, sample_list[1:]):
-            dx = current[1] - previous[1]
-            dy = current[2] - previous[2]
-            length = math.hypot(dx, dy)
-            if length <= 1e-6:
-                continue
-            path += length
-            vectors.append((dx / length, dy / length))
-        displacement = math.hypot(
-            samples[-1][1] - samples[0][1],
-            samples[-1][2] - samples[0][2],
-        )
-        total_turn = 0.0
-        for previous, current in zip(vectors, vectors[1:]):
-            dot = max(
-                -1.0,
-                min(1.0, previous[0] * current[0] + previous[1] * current[1]),
-            )
-            total_turn += math.acos(dot)
-        return duration, path, displacement, total_turn
-
-    def _activity_run_looks_passive(self, player: Player) -> bool:
-        _, path, displacement, total_turn = self._activity_trajectory(
-            player.activity_run_samples
-        )
-        minimum_distance = max(
-            0.1, float(self.config.get("afk_straight_minimum_distance", 6.0))
-        )
-        minimum_ratio = min(
-            1.0, max(0.0, float(self.config.get("afk_straight_ratio", 0.92)))
-        )
-        maximum_turn = math.radians(
-            max(
-                0.0,
-                float(self.config.get("afk_straight_maximum_turn_degrees", 20)),
-            )
-        )
-        return (
-            path >= minimum_distance
-            and displacement / max(path, 1e-9) >= minimum_ratio
-            and total_turn <= maximum_turn
-        )
-
-    async def _record_passive_motion(
-        self,
-        player: Player,
-        now: float,
-        position: tuple[float, float],
-        native_idle_seconds: float,
-        previous_position: tuple[float, float] | None = None,
-    ) -> None:
-        sample = (now, position[0], position[1])
-        player.activity_run_samples.append(sample)
-        maximum_samples = max(
-            8, int(self.config.get("afk_motion_maximum_samples", 240))
-        )
-        while len(player.activity_run_samples) > maximum_samples:
-            player.activity_run_samples.popleft()
-
-        if player.afk:
-            recent_input = native_idle_seconds <= max(
-                0.25,
-                float(self.config.get("afk_recovery_input_seconds", 2.5)),
-            )
-            if not recent_input:
-                player.afk_recovery_samples.clear()
-                return
-            if not player.afk_recovery_samples and previous_position is not None:
-                player.afk_recovery_samples.append((now, *previous_position))
-            player.afk_recovery_samples.append(sample)
-            while len(player.afk_recovery_samples) > maximum_samples:
-                player.afk_recovery_samples.popleft()
-            duration, path, _, total_turn = self._activity_trajectory(
-                player.afk_recovery_samples
-            )
-            if (
-                duration
-                >= max(
-                    1.0,
-                    float(self.config.get("afk_recovery_motion_seconds", 3.0)),
-                )
-                and path
-                >= max(
-                    0.1,
-                    float(self.config.get("afk_recovery_distance", 4.0)),
-                )
-                and total_turn
-                >= math.radians(
-                    max(
-                        1.0,
-                        float(self.config.get("afk_recovery_turn_degrees", 15)),
-                    )
-                )
-            ):
-                await self._record_player_activity(player, now)
-            return
-
-        player.activity_area_samples.append(sample)
-        confinement_seconds = max(
-            1.0,
-            float(
-                self.config.get(
-                    "afk_confinement_seconds",
-                    self.config.get("afk_timeout_seconds", 60),
-                )
-            ),
-        )
-        while (
-            player.activity_area_samples
-            and now - player.activity_area_samples[0][0]
-            > confinement_seconds * 1.1
-        ):
-            player.activity_area_samples.popleft()
-        if len(player.activity_area_samples) < 2:
-            return
-        area_duration = now - player.activity_area_samples[0][0]
-        xs = [item[1] for item in player.activity_area_samples]
-        ys = [item[2] for item in player.activity_area_samples]
-        area_span = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
-        maximum_span = max(
-            0.1, float(self.config.get("afk_confinement_maximum_span", 12.0))
-        )
-        if area_duration >= confinement_seconds * 0.95 and area_span <= maximum_span:
-            await self._set_player_afk(player)
 
     async def _handle_player_activity_snapshot(self, payload: str) -> None:
         parts = payload.split()
@@ -11083,6 +11011,7 @@ class TronnerRacing:
         snapshot_speed: float | None = None
         snapshot_turns: int | None = None
         snapshot_distance: float | None = None
+        last_turn_idle_seconds: float | None = None
         if len(parts) >= 10:
             try:
                 exact_game_time = float(parts[5])
@@ -11119,26 +11048,41 @@ class TronnerRacing:
                 if not math.isfinite(exact_distance) or exact_distance < 0:
                     return
                 snapshot_distance = exact_distance
+            if len(parts) >= 12:
+                try:
+                    exact_turn_idle = float(parts[11])
+                except ValueError:
+                    return
+                if not math.isfinite(exact_turn_idle) or exact_turn_idle < -1:
+                    return
+                if exact_turn_idle >= 0:
+                    last_turn_idle_seconds = exact_turn_idle
         now = time.monotonic()
-        candidate_activity = now - native_idle_seconds
-        previous_position = player.last_activity_position
-        was_alive = player.activity_cycle_alive
         player.activity_snapshot_seen = True
-        player.activity_cycle_alive = cycle_alive
-        player.last_activity_position = position if cycle_alive else None
 
-        if snapshot_distance is not None:
-            token = self.active_replay_tokens.get(id(player))
-            capture = self.replay_captures.get(token or "")
-            if capture is not None:
+        if cycle_alive and last_turn_idle_seconds is not None:
+            candidate_turn = now - last_turn_idle_seconds
+            if (
+                player.last_turn_monotonic is None
+                or candidate_turn > player.last_turn_monotonic + 0.5
+            ):
+                await self._record_player_turn(player, candidate_turn)
+        elif cycle_alive and player.last_turn_monotonic is None:
+            # The engine has not observed a turn in this life. This normally
+            # means the controller attached mid-run, so start one grace window
+            # instead of marking the racer AFK immediately.
+            player.last_turn_monotonic = now
+
+        token = self.active_replay_tokens.get(id(player))
+        capture = self.replay_captures.get(token or "")
+        if capture is not None:
+            if snapshot_distance is not None:
                 capture.latest_distance = max(
                     capture.initial_distance, snapshot_distance
                 )
+            self._record_replay_route_progress(capture, position)
 
         if not cycle_alive:
-            if player.active and player.dead_since_monotonic is None:
-                player.dead_since_monotonic = now
-            player.afk_recovery_samples.clear()
             return
 
         if snapshot_game_time is not None:
@@ -11153,41 +11097,6 @@ class TronnerRacing:
                 turns=snapshot_turns,
             )
 
-        moved = False
-        if cycle_alive and previous_position is not None and was_alive:
-            epsilon = max(
-                0.0,
-                float(self.config.get("afk_position_epsilon", 0.01)),
-            )
-            moved = (
-                (position[0] - previous_position[0]) ** 2
-                + (position[1] - previous_position[1]) ** 2
-                > epsilon**2
-            )
-        elif cycle_alive and previous_position is None:
-            player.activity_run_samples.append((now, *position))
-            player.activity_area_samples.append((now, *position))
-
-        last_activity = player.last_activity_monotonic
-        native_input = (
-            last_activity is None
-            or candidate_activity > last_activity + 0.5
-        )
-        if moved:
-            await self._record_passive_motion(
-                player,
-                now,
-                position,
-                native_idle_seconds,
-                previous_position,
-            )
-            if not player.afk:
-                player.last_activity_monotonic = now
-        if native_input and not player.afk:
-            player.last_activity_monotonic = max(
-                candidate_activity,
-                player.last_activity_monotonic or candidate_activity,
-            )
         await self._record_final_countdown_progress(
             player, now, position, native_idle_seconds
         )
@@ -11863,8 +11772,8 @@ class TronnerRacing:
             at_risk = any(
                 not player.afk
                 and (
-                    player.last_activity_monotonic is None
-                    or now - player.last_activity_monotonic >= timeout - probe_lead
+                    player.last_turn_monotonic is None
+                    or now - player.last_turn_monotonic >= timeout - probe_lead
                 )
                 for player in players
             )
@@ -12172,7 +12081,6 @@ class TronnerRacing:
         access_level: int,
         arguments: str,
     ) -> None:
-        await self._record_player_activity(player)
         if not await self._command_rate_allowed(player):
             return
         hot_commands = getattr(self, "hot_commands", None)
@@ -13028,7 +12936,7 @@ class TronnerRacing:
         return filename
 
     async def _refresh_ghost_selections(self, record_key: str) -> None:
-        """Re-resolve active PB/WR/rank/name selections after a finished run."""
+        """Re-resolve active or persistent selections after a saved run."""
         if not self.current or map_records_key(self.current) != record_key:
             return
         seen_players: set[int] = set()
@@ -13041,9 +12949,13 @@ class TronnerRacing:
                 continue
             seen_players.add(id(player))
             state = getattr(self, "ghost_selections", {}).get(player.identity_key)
-            if not isinstance(state, dict):
-                continue
-            selector = plain_console_text(state.get("selector", ""))
+            selector = (
+                plain_console_text(state.get("selector", ""))
+                if isinstance(state, dict)
+                else getattr(self, "ghost_preferences", {}).get(
+                    player.identity_key, ""
+                )
+            )
             if selector:
                 await self._command_ghost(player, selector, automatic=True)
 
@@ -13053,32 +12965,74 @@ class TronnerRacing:
         argument: str,
         *,
         automatic: bool = False,
+        silent: bool = False,
     ) -> bool:
         requested = (plain_console_text(argument).strip() or "pb")[:128]
         if requested.casefold() in {"off", "none", "clear"}:
             await self.sink.send(f"GHOST_CLEAR {player.target}")
-            if player.identity_key in getattr(self, "ghost_selections", {}):
-                self.ghost_selections.pop(player.identity_key, None)
-                self._save_ghost_selections()
-            await self.private(player, "Your replay ghost is disabled.")
+            getattr(self, "ghost_selections", {}).pop(player.identity_key, None)
+            preferences = getattr(self, "ghost_preferences", {})
+            if player.identity_key in preferences:
+                preferences.pop(player.identity_key, None)
+                self._save_ghost_preferences()
+            if not automatic:
+                await self.private(player, "Your replay ghost is disabled.")
             return True
+        persistent_selector = normalize_ghost_preference(requested)
+        if persistent_selector is not None:
+            requested = persistent_selector
+            if not automatic:
+                if not hasattr(self, "ghost_preferences"):
+                    self.ghost_preferences = {}
+                self.ghost_preferences[player.identity_key] = requested
+                self._save_ghost_preferences()
         if not self.current or not self.round_active or self.transitioning:
             if not automatic:
-                await self.private(player, "A replay ghost requires an active map.")
+                if persistent_selector is not None:
+                    await self.private(
+                        player,
+                        "Your ghost preference was saved and will apply when a map is active.",
+                    )
+                else:
+                    await self.private(player, "A replay ghost requires an active map.")
             return False
         records = self.store.records(map_records_key(self.current))
         record, rank, selection = self._ghost_record_for_selector(
             records, player, requested
         )
+        unfinished_pb = False
         if record is None or rank is None:
-            if not automatic:
-                await self.private(player, selection)
-            return False
-        replays = self.store.ghost_replays_for_record(
-            map_records_key(self.current),
-            record,
-            self._ghost_replay_map_keys(),
-        )
+            if requested != "pb":
+                if not automatic:
+                    await self.private(player, selection)
+                return False
+            replays = self.store.ghost_replays_for_unfinished_pb(
+                map_records_key(self.current),
+                player.identity_key,
+                self._ghost_replay_map_keys(),
+            )
+            if not replays:
+                if not automatic:
+                    await self.private(
+                        player,
+                        "Your PB ghost is enabled, but you do not have a usable "
+                        "attempt on this map yet.",
+                    )
+                return False
+            replay = replays[0]
+            unfinished_pb = True
+            selection = "PB"
+            target_identity_key = replay.identity_key
+            target_username = replay.username
+        else:
+            replays = self.store.ghost_replays_for_record(
+                map_records_key(self.current),
+                record,
+                self._ghost_replay_map_keys(),
+            )
+            replay = replays[0] if replays else None
+            target_identity_key = record.identity_key
+            target_username = record.username
         if not replays:
             if not automatic:
                 await self.private(
@@ -13089,7 +13043,7 @@ class TronnerRacing:
         active_settings = getattr(
             self, "active_replay_settings_identifier", None
         )
-        replay = replays[0]
+        assert replay is not None
         position_scale = self.repository.ghost_coordinate_scale(
             self.current,
             replay.resource_key,
@@ -13120,7 +13074,7 @@ class TronnerRacing:
                 "geometry_verified=%s physics_verified=%s",
                 map_records_key(self.current),
                 replay.run_id,
-                record.identity_key,
+                target_identity_key,
                 geometry_verified,
                 physics_verified,
             )
@@ -13167,12 +13121,15 @@ class TronnerRacing:
                 for state in replay.event_states
             ),
         )
-        label = ghost_display_name(rank, record.username)
+        label = ghost_display_name(
+            target_username,
+            personal_best=target_identity_key == player.identity_key,
+        )
         resolved_selection = {
             "selector": requested,
             "runId": replay.run_id,
-            "rank": rank,
-            "recordIdentityKey": record.identity_key,
+            "rank": rank or 0,
+            "recordIdentityKey": target_identity_key,
             "ghostName": label,
         }
         previous_selection = getattr(self, "ghost_selections", {}).get(
@@ -13205,31 +13162,45 @@ class TronnerRacing:
         if not hasattr(self, "ghost_selections"):
             self.ghost_selections = {}
         self.ghost_selections[player.identity_key] = resolved_selection
-        self._save_ghost_selections()
+        if not automatic and persistent_selector is None:
+            preferences = getattr(self, "ghost_preferences", {})
+            if player.identity_key in preferences:
+                preferences.pop(player.identity_key, None)
+                self._save_ghost_preferences()
         decimals = race_time_decimals(self.current)
         exact_ranked_run = (
-            replay.finish_seconds == record.best_seconds
+            record is not None
+            and replay.finish_seconds == record.best_seconds
             and replay.finish_turns == record.best_turns
         )
-        if exact_ranked_run:
+        if unfinished_pb:
+            message = "Selected PB: your closest unfinished attempt. "
+        elif exact_ranked_run:
             message = (
-                f"Selected {selection}: {record.username}, "
+                f"Selected {selection}: {target_username}, "
                 f"{record.best_seconds:.{decimals}f}s. "
             )
         else:
             message = (
                 f"Selected fastest available replay for {selection}: "
-                f"{record.username}, {replay.finish_seconds:.{decimals}f}s "
+                f"{target_username}, {replay.finish_seconds:.{decimals}f}s "
                 f"(ranked time {record.best_seconds:.{decimals}f}s). "
             )
-        if automatic:
-            await self.private(
-                player,
-                f"Your {selection} ghost was updated to {record.username}, "
-                f"{replay.finish_seconds:.{decimals}f}s. It will start with "
-                "your next attempt.",
-            )
-        else:
+        if automatic and not silent:
+            if unfinished_pb:
+                await self.private(
+                    player,
+                    "Your PB ghost was updated to your closest unfinished "
+                    "attempt. It will start with your next attempt.",
+                )
+            else:
+                await self.private(
+                    player,
+                    f"Your {selection} ghost was updated to {target_username}, "
+                    f"{replay.finish_seconds:.{decimals}f}s. It will start with "
+                    "your next attempt.",
+                )
+        elif not automatic:
             await self.private(
                 player,
                 message + "The private ghost will start with your next attempt.",
@@ -14641,8 +14612,8 @@ class TronnerRacing:
             player.connected
             and player.active
             and not player.is_ai
-            and player.last_activity_monotonic is not None
-            and now - player.last_activity_monotonic <= activity_window
+            and player.last_turn_monotonic is not None
+            and now - player.last_turn_monotonic <= activity_window
             for player in self.players.values()
         )
         if not active_human:

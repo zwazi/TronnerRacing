@@ -53,7 +53,7 @@ class HelpfulMessageTests(unittest.IsolatedAsyncioTestCase):
                 "Racer",
                 connected=True,
                 active=True,
-                last_activity_monotonic=time.monotonic(),
+                last_turn_monotonic=time.monotonic(),
             )
             controller.players[player.log_name] = player
             with patch("TronnerRacing.random.shuffle", side_effect=lambda items: None):
@@ -89,14 +89,14 @@ class HelpfulMessageTests(unittest.IsolatedAsyncioTestCase):
                 "Spectator",
                 connected=True,
                 active=False,
-                last_activity_monotonic=time.monotonic(),
+                last_turn_monotonic=time.monotonic(),
             )
             stale_racer = Player(
                 "afk",
                 "AFK",
                 connected=True,
                 active=True,
-                last_activity_monotonic=time.monotonic() - 181,
+                last_turn_monotonic=time.monotonic() - 181,
             )
             controller.players = {
                 spectator.log_name: spectator,
@@ -120,7 +120,7 @@ class HelpfulMessageTests(unittest.IsolatedAsyncioTestCase):
                 connected=True,
                 active=True,
                 is_ai=True,
-                last_activity_monotonic=time.monotonic(),
+                last_turn_monotonic=time.monotonic(),
             )
             controller.players = {ai.log_name: ai}
             controller.sink = Sink()
@@ -142,7 +142,7 @@ class HelpfulMessageTests(unittest.IsolatedAsyncioTestCase):
                 "Racer",
                 connected=True,
                 active=True,
-                last_activity_monotonic=time.monotonic(),
+                last_turn_monotonic=time.monotonic(),
             )
             controller.players = {player.log_name: player}
 
@@ -181,7 +181,7 @@ class HelpfulMessageTests(unittest.IsolatedAsyncioTestCase):
                 "Racer",
                 connected=True,
                 active=True,
-                last_activity_monotonic=time.monotonic(),
+                last_turn_monotonic=time.monotonic(),
             )
             controller.players = {player.log_name: player}
 
