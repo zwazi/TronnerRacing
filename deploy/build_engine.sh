@@ -11,6 +11,7 @@ patch_files=(
     "$repository_dir/engine/patches/ghost-replay.patch"
     "$repository_dir/engine/patches/start-zone-lifecycle.patch"
     "$repository_dir/engine/patches/native-start-brake.patch"
+    "$repository_dir/engine/patches/start-owner-prediction.patch"
 )
 temporary_workspace=
 

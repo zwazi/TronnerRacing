@@ -1,0 +1,55 @@
+--- a/src/tron/gCycle.cpp
++++ b/src/tron/gCycle.cpp
+@@ -5043,8 +5043,9 @@
+             se_cycleReleasedWriter.write();
+             sg_WriteCycleReplayState(this, "release", time);
+         }
+-        RequestSyncOwner();
+-        RequestSyncAll();
++        // A release is a state transition, not an ordinary periodic update.
++        // Send its authoritative state promptly and reliably to every viewer.
++        RequestSync(true);
+     }
+ }
+ 
+@@ -6806,6 +6807,20 @@
+     m << color_.b;
+ }
+ 
++bool gCycle::ClearToTransmit(int user) const
++{
++    // The owner has already predicted brake-off locally. During the existing
++    // chat/away confirmation window, acknowledging that input with a newer
++    // stopped/brake-on state undoes prediction and causes stop-then-jump.
++    // Temporarily defer only owner syncs; keep the queued latest state for
++    // release/cancellation. Creation, death and other viewers remain normal.
++    if (sn_GetNetState() == nSERVER && user == Owner() && Alive() &&
++            startBraked_ && startBrakeInput_.Pending() &&
++            HasBeenTransmitted(user))
++        return false;
++    return eNetGameObject::ClearToTransmit(user);
++}
++
+ static nVersionFeature sg_verletIntegration( 7 );
+ 
+ void gCycle::WriteSync(nMessage &m){
+--- a/src/tron/gCycle.h
++++ b/src/tron/gCycle.h
+@@ -339,6 +339,7 @@
+     // bool CanMakeTurn() const { return pendingTurns <= 0 && lastTime >= nextTurn; }
+ 
+     virtual void InitAfterCreation();
++    virtual bool ClearToTransmit(int user) const;
+     gCycle(eGrid *grid, const eCoord &pos,const eCoord &dir,ePlayerNetID *p=NULL);
+ 
+     static	void 	SetWallsStayUpDelay		( REAL delay );				//!< the time the cycle walls stay up ( negative values: they stay up forever )
+--- a/src/tron/gStartBrake.h
++++ b/src/tron/gStartBrake.h
+@@ -13,6 +13,7 @@
+ public:
+     gStartBrake() : pending_(-1) {}
+     void Reset() { pending_ = -1; }
++    bool Pending() const { return pending_ >= 0; }
+     void Input(bool brake, bool turned, bool chatting, double now, double lag)
+     {
+         if (chatting)

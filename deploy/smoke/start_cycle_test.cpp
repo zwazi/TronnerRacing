@@ -20,12 +20,29 @@ bool *sg_GetSpecs()
     return spectators;
 }
 
+// This fixture creates its grid directly, without gGame's network handshake.
+// Model the already-ready grid while retaining the player creation dependency;
+// gCycle's actual sync gate and all movement/release code remain under test.
+bool eNetGameObject::ClearToTransmit(int user) const
+{
+    return !Player() || Player()->HasBeenTransmitted(user);
+}
+
 class InputCycle : public gCycle
 {
 public:
     using gCycle::gCycle;
     void SetInputDirection(eCoord const &direction) { dirDrive = dir = direction; }
     void StepStockPhysics(REAL now) { gCycleMovement::TimestepCore(now, true); }
+    void Known(int user, bool known = true) { knowsAbout[user].knowsAboutExistence = known; }
+    void ClearSync(int user) { knowsAbout[user].syncReq = knowsAbout[user].nextSyncAck = false; }
+    bool ReliableSync(int user) const { return knowsAbout[user].syncReq && knowsAbout[user].nextSyncAck; }
+};
+
+class KnownPlayer : public ePlayerNetID
+{
+public:
+    void Known(int user) { knowsAbout[user].knowsAboutExistence = true; }
 };
 
 int main()
@@ -106,6 +123,55 @@ int main()
     assert(!manual->IsStartHeld(0));
     assert(std::abs(manual->Speed() - nativeSpeed) < .01);
     std::cout << "Real cycle held turns, focus cancellation and manual release passed" << std::endl;
+    KnownPlayer *networkPlayer = new KnownPlayer;
+    networkPlayer->Known(0);
+    networkPlayer->Known(1);
+    InputCycle *networkCycle = new InputCycle(grid, eCoord(300, 300), eCoord(1, 0), networkPlayer);
+    input->SetInputDirection(eCoord(1, 0));
+    input->SetBraking(0);
+    gDestination networkOff(*input);
+    networkCycle->StartBraked();
+    networkCycle->Known(0);
+    networkCycle->Known(1);
+    assert(networkCycle->ClearToTransmit(0));
+    assert(networkCycle->HandleStartHoldDestination(networkOff));
+    // Only the owner's contradictory held-state updates are deferred. Other
+    // viewers, object creation and the server's own physics stay unchanged.
+    assert(!networkCycle->ClearToTransmit(0));
+    assert(networkCycle->ClearToTransmit(1));
+    networkCycle->Known(0, false);
+    assert(networkCycle->ClearToTransmit(0));
+    networkCycle->Known(0);
+    REAL requestTime = se_GameTime();
+    eCoord serverHold = networkCycle->MapPosition();
+    networkCycle->TimestepCore(requestTime + .1);
+    assert(networkCycle->IsStartHeld(0));
+    assert(networkCycle->GetBraking() == 1);
+    assert(networkCycle->Speed() == 0);
+    assert((networkCycle->MapPosition() - serverHold).NormSquared() < 1e-8);
+    networkPlayer->SetChatting(ePlayerNetID::ChatFlags_Away, true);
+    networkCycle->TimestepCore(requestTime + .15);
+    assert(networkCycle->ClearToTransmit(0));
+    assert(networkCycle->IsStartHeld(0));
+    networkPlayer->SetChatting(ePlayerNetID::ChatFlags_Away, false);
+    networkCycle->HandleStartHoldDestination(networkOff);
+    networkCycle->ClearSync(0);
+    networkCycle->ClearSync(1);
+    networkCycle->TimestepCore(requestTime + 2);
+    assert(!networkCycle->IsStartHeld(0));
+    assert(networkCycle->ClearToTransmit(0));
+    assert(networkCycle->ReliableSync(0));
+    assert(networkCycle->ReliableSync(1));
+    assert(std::abs(networkCycle->Speed() - nativeSpeed) < .01);
+    // Death cannot remain hidden behind a pending manual release.
+    InputCycle *dying = new InputCycle(grid, eCoord(400, 400), eCoord(1, 0), networkPlayer);
+    dying->StartBraked();
+    dying->Known(0);
+    dying->HandleStartHoldDestination(networkOff);
+    assert(!dying->ClearToTransmit(0));
+    dying->Kill();
+    assert(dying->ClearToTransmit(0));
+    std::cout << "Owner prediction, spectator sync, cancellation and reliable release passed" << std::endl;
     // Leave static game-object cleanup to the OS, as in a dedicated shutdown.
     std::_Exit(0);
 }
