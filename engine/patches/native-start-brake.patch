@@ -1,0 +1,204 @@
+--- a/src/tron/gCycle.cpp
++++ b/src/tron/gCycle.cpp
+@@ -1691,28 +1691,31 @@
+             (!IsFrozen(se_GameTime()) && !startBraked_))
+         return false;
+ 
++    // Retransmitted or reordered held packets must never rotate the cycle or
++    // turn a canceled release back into a new request.
++    if (destination.messageID > 1 && lastStartHoldMessageID_ > 1 &&
++            static_cast<short>(destination.messageID - lastStartHoldMessageID_) <= 0)
++        return true;
++
+     // The synchronized turn counter is deliberately rewritten to the shortest
+     // net rotation during a hold, so direction is the authoritative proof of
+     // another held turn. Nearest winding filters harmless vector jitter from
+     // brake-only packets.
+     int winding = Grid()->DirectionWinding(destination.direction);
+-    if (winding != windingNumberWrapped_)
++    bool turned = winding != windingNumberWrapped_;
++    if (turned)
+     {
+         ApplyStartHoldDirection(winding);
+     }
+ 
+     if (startBraked_)
+     {
+-        // The client stays in its natural brake-off state during the hold.
+-        // Turns, chat, and focus changes therefore keep reporting false;
+-        // release only on an explicit brake-down packet or the timer.
+-        if (destination.braking && !freezeBrakeActionDown_)
+-        {
+-            freezeBrakeActionDown_ = true;
+-            AccelerationDiscontinuity();
+-            braking = 0;
+-            OnBrakeStateChanged(se_GameTime(), braking);
+-        }
++        // Countdown never accepts an early manual release. Manual starts use
++        // the stock brake-off destination, including its chat-state flag.
++        if (startBrakeReleaseTime_ < 0)
++            startBrakeInput_.Input(destination.braking, turned,
++                destination.chatting || (Player() && Player()->IsChatting()),
++                se_GameTime(), Lag());
+     }
+     else if (freezeUntilBrake_)
+     {
+@@ -3895,6 +3898,15 @@
+     if (!std::isfinite(skewDot))
+         skewDot=0;
+ 
++    if (sn_GetNetState() == nSERVER && startBraked_ &&
++            startBrakeReleaseTime_ < 0 &&
++            startBrakeInput_.Ready(Player() && Player()->IsChatting(), currentTime))
++    {
++        // Start the run when the hold actually ends, so recording, ghost and
++        // private-zone clocks all use the same physical release instant.
++        startBrakeReleaseTime_ = currentTime;
++    }
++
+     // Timed countdown and manual brake starts share the same server-side hold.
+     // Split the frame at the exact release time so controller timing remains
+     // independent of the dedicated server's frame duration.
+@@ -3921,6 +3933,11 @@
+             (startBraked_ ||
+              (freezeUntil_ >= 0 && currentTime <= freezeUntil_)) )
+     {
++        if (startBraked_)
++        {
++            braking = 1;
++            brakingReservoir = 1;
++        }
+         pos = freezePosition_;
+         dirDrive = freezeDirection_;
+         dir = freezeDirection_;
+@@ -4899,23 +4916,19 @@
+         }
+         if ( startBraked_ && s_brake == *Act )
+         {
+-            if (x > .5 && !freezeBrakeActionDown_)
++            if (x > .5 && startBrakeReleaseTime_ < 0)
+             {
+-                freezeBrakeActionDown_ = true;
+-                AccelerationDiscontinuity();
+-                braking = 0;
+-                OnBrakeStateChanged(se_GameTime(), braking);
++                startBrakeInput_.Input(false, false,
++                    Player() && Player()->IsChatting(), se_GameTime(), Lag());
+             }
+             return true;
+         }
+         if ( startBraked_ && s_brakeToggle == *Act )
+         {
+-            if (x > 0 && !freezeBrakeActionDown_)
++            if (x > 0 && startBrakeReleaseTime_ < 0)
+             {
+-                freezeBrakeActionDown_ = true;
+-                AccelerationDiscontinuity();
+-                braking = 0;
+-                OnBrakeStateChanged(se_GameTime(), braking);
++                startBrakeInput_.Input(false, false,
++                    Player() && Player()->IsChatting(), se_GameTime(), Lag());
+             }
+             return true;
+         }
+@@ -5011,11 +5024,7 @@
+         freezeStartHoldTurns_ = false;
+         raceStartTime_ = time;
+         sg_ResetPrivateZonesForUser(Owner(), true);
+-        if (freezeClientZeroAcceleration_)
+-        {
+-            sg_ReleaseClientZeroAcceleration(Owner());
+-            freezeClientZeroAcceleration_ = false;
+-        }
++        startBrakeInput_.Reset();
+         brakingReservoir = 1;
+         verletSpeed_ = releaseSpeed;
+         acceleration = 0;
+@@ -8583,8 +8592,9 @@
+     if (currentWall)
+         DropWall(false);
+ 
+-    if (!freezeClientZeroAcceleration_)
+-        freezeClientZeroAcceleration_ = sg_AcquireClientZeroAcceleration(Owner());
++    // Use the ordinary per-cycle synchronized brake. No network configuration
++    // is sent, so another racer or ghost on this client keeps normal physics.
++    startBrakeInput_.Reset();
+ 
+     freezeUntil_ = -1;
+     freezeReleaseStart_ = -1;
+@@ -8603,7 +8613,7 @@
+     if (std::isfinite(releaseAfterSeconds) && releaseAfterSeconds >= 0)
+         startBrakeReleaseTime_ = se_GameTime() + releaseAfterSeconds;
+ 
+-    braking = 0;
++    braking = 1;
+     brakingReservoir = 1;
+     verletSpeed_ = 0;
+     acceleration = 0;
+--- a/src/tron/gCycle.h
++++ b/src/tron/gCycle.h
+@@ -41,6 +41,7 @@
+ #include "rDisplayList.h"
+ 
+ #include "gCycleMovement.h"
++#include "gStartBrake.h"
+ 
+ class rModel;
+ class gTextureCycle;
+@@ -182,6 +183,7 @@
+     unsigned short lastStartHoldMessageID_; //!< newest consumed held input acknowledged to the owner
+     int startHoldInitialWinding_; //!< direction at the beginning of a held start
+     unsigned short startHoldInitialTurns_; //!< turn count at the beginning of a held start
++    gStartBrake startBrakeInput_; //!< confirmation of stock brake-off input
+     bool startBraked_; //!< whether this cycle is staged under its ordinary synchronized brake
+     REAL startBrakeReleaseTime_; //!< automatic brake-off time, or negative for player release
+     REAL startBrakeReleaseSpeed_; //!< native spawn/checkpoint speed restored at brake release
+--- /dev/null
++++ b/src/tron/gStartBrake.h
+@@ -0,0 +1,46 @@
++#ifndef TRONNER_START_BRAKE_H
++#define TRONNER_START_BRAKE_H
++
++#include <algorithm>
++#include <cmath>
++
++// Stock clients report the resulting brake state, not the physical key. Keep
++// native braking engaged while waiting; a turn carrying that state is not a
++// release. Defer brake-off briefly because ClearKeys precedes the chat/away
++// player sync on older clients.
++class gStartBrake
++{
++public:
++    gStartBrake() : pending_(-1), sawBrake_(false) {}
++    void Reset() { pending_ = -1; sawBrake_ = false; }
++    void Input(bool brake, bool turned, bool chatting, double now, double lag)
++    {
++        if (chatting)
++        {
++            pending_ = -1;
++            return;
++        }
++        if (brake)
++        {
++            sawBrake_ = true;
++            pending_ = -1;
++        }
++        else if ((!turned || sawBrake_) && pending_ < 0)
++        {
++            double wait = std::isfinite(lag) ? 2 * lag + .1 : .25;
++            wait = std::max(.25, std::min(1.0, wait));
++            pending_ = now + wait;
++        }
++    }
++    bool Ready(bool chatting, double now)
++    {
++        if (chatting)
++            pending_ = -1;
++        return pending_ >= 0 && now >= pending_;
++    }
++private:
++    double pending_;
++    bool sawBrake_;
++};
++
++#endif

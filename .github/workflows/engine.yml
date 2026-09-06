@@ -39,6 +39,15 @@ jobs:
           TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
           TRONNER_ENGINE_PREFIX: ${{ runner.temp }}/armagetronad
         run: ./deploy/build_engine.sh
+      - name: Test actual cycle hold and release
+        env:
+          TRONNER_ENGINE_SOURCE_DIR: ${{ runner.temp }}/engine-source
+          TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
+          TRONNER_ENGINE_DATA_DIR: ${{ runner.temp }}/armagetronad/share/games/armagetronad-dedicated
+        run: |
+          ./deploy/smoke/build_probes.sh
+          cd "$RUNNER_TEMP"
+          "$TRONNER_ENGINE_BUILD_DIR/tronner-smoke-probes/start_cycle_test"
       - name: Upload test binary
         uses: actions/upload-artifact@v7
         with:
