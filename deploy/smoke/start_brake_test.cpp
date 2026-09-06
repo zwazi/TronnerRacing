@@ -10,6 +10,10 @@ int main()
     assert(!hold.Ready(false, 2));
     hold.Input(true, true, false, 2, .05);
     assert(!hold.Ready(false, 3));
+    // Even after a prior brake-on, a turn carrying stale brake-off is not
+    // evidence of a brake key action (for example, after focus returns).
+    hold.Input(false, true, false, 2, .05);
+    assert(!hold.Ready(false, 3));
     // Native brake-off starts after the confirmation window.
     hold.Input(false, false, false, 3, .05);
     assert(!hold.Ready(false, 3.249));

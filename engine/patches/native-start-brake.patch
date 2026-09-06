@@ -155,7 +155,7 @@
      REAL startBrakeReleaseSpeed_; //!< native spawn/checkpoint speed restored at brake release
 --- /dev/null
 +++ b/src/tron/gStartBrake.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,44 @@
 +#ifndef TRONNER_START_BRAKE_H
 +#define TRONNER_START_BRAKE_H
 +
@@ -169,8 +169,8 @@
 +class gStartBrake
 +{
 +public:
-+    gStartBrake() : pending_(-1), sawBrake_(false) {}
-+    void Reset() { pending_ = -1; sawBrake_ = false; }
++    gStartBrake() : pending_(-1) {}
++    void Reset() { pending_ = -1; }
 +    void Input(bool brake, bool turned, bool chatting, double now, double lag)
 +    {
 +        if (chatting)
@@ -180,10 +180,9 @@
 +        }
 +        if (brake)
 +        {
-+            sawBrake_ = true;
 +            pending_ = -1;
 +        }
-+        else if ((!turned || sawBrake_) && pending_ < 0)
++        else if (!turned && pending_ < 0)
 +        {
 +            double wait = std::isfinite(lag) ? 2 * lag + .1 : .25;
 +            wait = std::max(.25, std::min(1.0, wait));
@@ -198,7 +197,6 @@
 +    }
 +private:
 +    double pending_;
-+    bool sawBrake_;
 +};
 +
 +#endif
