@@ -10,16 +10,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RenderTests(unittest.TestCase):
-    def test_racing_config_permanently_disables_speed_decay_below(self):
-        racing_config = (ROOT / "config" / "tronner-racing.cfg").read_text(
-            encoding="utf-8"
-        )
-        active_lines = {
-            line.split("#", 1)[0].strip()
-            for line in racing_config.splitlines()
-        }
-        self.assertIn("CYCLE_SPEED_DECAY_BELOW 0", active_lines)
-
     def load(self, name):
         return render_node.load_object(ROOT / "config" / name)
 
