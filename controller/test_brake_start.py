@@ -75,46 +75,12 @@ async def cancel_player_tasks(controller, player):
 
 
 class StartModeTests(unittest.IsolatedAsyncioTestCase):
-    def test_engine_uses_explicit_brake_down_without_turn_or_focus_release(self):
+    def test_build_includes_native_brake_regressions(self):
         root = Path(__file__).resolve().parents[1]
-        engine_patch = "\n".join(
-            path.read_text(encoding="utf-8")
-            for path in (
-                root / "engine/patches/tronner-racing.patch",
-                root / "engine/patches/start-zone-lifecycle.patch",
-            )
-        )
-        lifecycle_patch = (
-            root / "engine/patches/start-zone-lifecycle.patch"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn('"RESPAWN_PLAYER_BRAKED"', engine_patch)
-        self.assertIn('"RESPAWN_PLAYER_CHECKPOINT_BRAKED"', engine_patch)
-        self.assertIn('"RESPAWN_PLAYER_PRACTICE_BRAKED"', engine_patch)
-        self.assertIn("-    braking = 1;", lifecycle_patch)
-        self.assertIn("+    braking = 0;", lifecycle_patch)
-        self.assertIn(
-            "freezeClientZeroAcceleration_ = "
-            "sg_AcquireClientZeroAcceleration(Owner())",
-            lifecycle_patch,
-        )
-        self.assertIn(
-            "(startBraked_ ||",
-            lifecycle_patch,
-        )
-        self.assertIn(
-            "sg_ReleaseClientZeroAcceleration(Owner())", lifecycle_patch
-        )
-        self.assertIn("startHoldInitialWinding_", engine_patch)
-        self.assertIn("five left on eight axes counts as three turns", engine_patch)
-        self.assertIn(
-            "if (destination.braking && !freezeBrakeActionDown_)", engine_patch
-        )
-        self.assertIn("lastTime = releaseTime;", lifecycle_patch)
-        self.assertNotIn(
-            "+                gCycleMovement::TimestepCore(releaseTime",
-            lifecycle_patch,
-        )
+        build = (root / "deploy/build_engine.sh").read_text(encoding="utf-8")
+        self.assertIn("engine/patches/native-start-brake.patch", build)
+        self.assertIn("deploy/smoke/start_brake_test.cpp", build)
+        self.assertIn('"$build_dir/start-brake-test"', build)
 
     def test_private_zone_lifetime_tracks_the_actual_run_start(self):
         root = Path(__file__).resolve().parents[1]

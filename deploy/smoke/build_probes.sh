@@ -32,7 +32,7 @@ mapfile -t zthread_cxxflags < <(read_make_flags ZTHREAD_CXXFLAGS)
 mapfile -t zthread_libs < <(read_make_flags ZTHREAD_LIBS)
 
 mkdir -p "$output_dir"
-for probe in network_hold server_info_probe; do
+for probe in network_hold server_info_probe start_cycle_test; do
     g++ -std=c++11 -O2 -Wl,--allow-multiple-definition \
         -I"$build_dir" -I"$build_dir/src" \
         -iquote "$source_dir/src" \

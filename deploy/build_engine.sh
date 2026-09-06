@@ -10,6 +10,7 @@ patch_files=(
     "$repository_dir/engine/patches/tronner-racing.patch"
     "$repository_dir/engine/patches/ghost-replay.patch"
     "$repository_dir/engine/patches/start-zone-lifecycle.patch"
+    "$repository_dir/engine/patches/native-start-brake.patch"
 )
 temporary_workspace=
 
@@ -52,6 +53,8 @@ for patch_file in "${patch_files[@]}"; do
     git -C "$source_dir" apply "$patch_file"
 done
 
+python3 "$repository_dir/deploy/smoke/check_start_source.py" "$source_dir"
+
 (
     cd "$source_dir"
     ./bootstrap.sh
@@ -74,6 +77,9 @@ cd "$build_dir"
     --disable-migratestate \
     CXXFLAGS=-O2
 make -j"$jobs"
+g++ -std=c++11 -O2 -I"$source_dir/src/tron" \
+    "$repository_dir/deploy/smoke/start_brake_test.cpp" -o "$build_dir/start-brake-test"
+"$build_dir/start-brake-test"
 make install
 
 binary="$install_prefix/bin/armagetronad-dedicated"
