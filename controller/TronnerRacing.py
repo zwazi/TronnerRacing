@@ -1267,42 +1267,12 @@ def send_resend_report(
     endpoint: str = RESEND_ENDPOINT,
     timeout_seconds: float = 10.0,
 ) -> None:
-    """Send one complete report without exposing its API key in logs or argv."""
-    request_body = json.dumps(
-        {
-            "from": sender,
-            "to": [recipient],
-            "subject": subject,
-            "text": body,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        endpoint,
-        data=request_body,
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "TronnerRacing/1.0",
-        },
-        method="POST",
+    """Send a report with bounded retries and provider-side deduplication."""
+    from report_email import send_report_email
+
+    send_report_email(
+        api_key, recipient, sender, subject, body, endpoint, timeout_seconds
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            status = response.getcode()
-            response_body = response.read(16384)
-    except urllib.error.HTTPError as error:
-        status = error.code
-        response_body = error.read(16384)
-    if not 200 <= status < 300:
-        raise RuntimeError(f"report service returned HTTP {status}")
-    try:
-        result = json.loads(response_body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError("report service returned an invalid response") from error
-    if not isinstance(result, dict) or not result.get("id"):
-        raise RuntimeError("report service rejected the submission")
 
 
 class GameLinkServiceError(RuntimeError):
